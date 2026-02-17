@@ -1,2 +1,5 @@
 data/*
 training/checkpoints/*
+training/test_video_loading.py
+training/test_dataloader_hang.py
+__pycache__/*
