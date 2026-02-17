@@ -1,5 +1,8 @@
-data/*
-training/checkpoints/*
+data/
+training/checkpoints/
 training/test_video_loading.py
 training/test_dataloader_hang.py
-__pycache__/*
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
