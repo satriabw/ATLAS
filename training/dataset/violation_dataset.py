@@ -1,13 +1,12 @@
-import cv2
 import logging
+import re
 import numpy as np
 import pandas as pd
 import pickle
 import torch
 from torch.utils.data import Dataset
-from torchvision import transforms
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -17,263 +16,221 @@ logger = logging.getLogger(__name__)
 class ViolationLabel:
     video_id: str
     tracking_id: int
+    roi: str          # 'BOT' or 'TOP'
     start_frame: int
     end_frame: int
-    violation_type: int
-    
+    annotation: int   # 0=violation, 1=compliance
 
-def parse_spatial_label(label_str: str) -> ViolationLabel:
-    v_idx = label_str.find('V')
-    i_idx = label_str.find('I')
-    s_idx = label_str.find('S')
-    e_idx = label_str.find('E')
-    a_idx = label_str.find('A')
-    
-    video_num = int(label_str[v_idx+1:i_idx])
-    tracking_id = int(label_str[i_idx+1:s_idx])
-    start_frame = int(label_str[s_idx+1:e_idx])
-    end_frame = int(label_str[e_idx+1:a_idx])
-    annotation = int(label_str[a_idx+1:])
-    
-    return ViolationLabel(
-        video_id=f'video_{video_num:03d}',
-        tracking_id=tracking_id,
-        start_frame=start_frame,
-        end_frame=end_frame,
-        violation_type=annotation
-    )
+
+def parse_train_label(label_str: str) -> Tuple[str, int, str, int]:
+    """Parse 'V001I00002S1D0R0A1' -> (video_id, tracking_id, roi, annotation).
+
+    S1 = BOT, S0 = TOP
+    A0 = violation, A1 = compliance
+    """
+    m = re.match(r'V(\d+)I(\d+)S(\d)D\d+R\d+A(\d)', label_str)
+    if not m:
+        raise ValueError(f"Cannot parse label string: {label_str!r}")
+    video_id = f"video_{int(m.group(1)):03d}"
+    tracking_id = int(m.group(2))
+    roi = 'BOT' if m.group(3) == '1' else 'TOP'
+    annotation = int(m.group(4))
+    return video_id, tracking_id, roi, annotation
+
+
+def _to_loc(val) -> np.ndarray:
+    """Convert object array of (2,) coord arrays to (T, 2) float32 ndarray."""
+    arr = np.asarray(val)
+    if arr.dtype == object:
+        return np.stack(arr.tolist()).astype(np.float32)
+    return arr.astype(np.float32).reshape(-1, 2)
+
+
+def _to_scalar_seq(val) -> np.ndarray:
+    """Convert speed/distance sequence to (T,) float32 ndarray."""
+    return np.asarray(val, dtype=np.float32).ravel()
+
+
+def _to_frames(val) -> np.ndarray:
+    """Convert frame index sequence to (T,) int64 ndarray."""
+    return np.asarray(val, dtype=np.int64).ravel()
+
+
+def _build_group_trajectory(
+    group_df: pd.DataFrame,
+) -> Tuple[int, int, np.ndarray]:
+    """Build trajectory for one (v_track_id, roi) group.
+
+    Frame range  = min/max across ALL rows in group.
+    Trajectory   = first pedestrian (earliest-appearing p_track_id) only,
+                   rows concatenated in frame order.
+
+    Returns (start_frame, end_frame, features) where features is (T, 7):
+        [v_loc_x, v_loc_y, v_speed, p_loc_x, p_loc_y, p_speed, v_p_distance]
+    """
+    group_df = group_df.copy()
+    group_df['_first_frame'] = group_df['frames'].apply(lambda f: int(_to_frames(f)[0]))
+    group_df = group_df.sort_values('_first_frame').reset_index(drop=True)
+
+    # Frame range from ALL rows
+    all_frames_flat = np.concatenate([_to_frames(row['frames']) for _, row in group_df.iterrows()])
+    start_frame = int(all_frames_flat.min())
+    end_frame = int(all_frames_flat.max())
+
+    # Pick first pedestrian by chronological order
+    first_ped = int(group_df.iloc[0]['p_track_id'])
+    ped_rows = group_df[group_df['p_track_id'] == first_ped]
+
+    # Concatenate trajectory data across matching rows
+    frames_parts, v_loc_parts, v_sp_parts, p_loc_parts, p_sp_parts = [], [], [], [], []
+    for _, row in ped_rows.iterrows():
+        frames_parts.append(_to_frames(row['frames']))
+        v_loc_parts.append(_to_loc(row['v_loc_planar']))    # (N, 2)
+        v_sp_parts.append(_to_scalar_seq(row['v_speed']))   # (N,)
+        p_loc_parts.append(_to_loc(row['p_loc_planar']))    # (N, 2)
+        p_sp_parts.append(_to_scalar_seq(row['p_speed']))   # (N,)
+
+    all_f = np.concatenate(frames_parts)
+    order = np.argsort(all_f, kind='stable')
+
+    v_loc_a = np.vstack(v_loc_parts)[order]                    # (T, 2)
+    v_sp_a = np.concatenate(v_sp_parts)[order].reshape(-1, 1)  # (T, 1)
+    p_loc_a = np.vstack(p_loc_parts)[order]                    # (T, 2)
+    p_sp_a = np.concatenate(p_sp_parts)[order].reshape(-1, 1)  # (T, 1)
+    dists = np.linalg.norm(v_loc_a - p_loc_a, axis=1, keepdims=True)  # (T, 1)
+
+    features = np.concatenate([v_loc_a, v_sp_a, p_loc_a, p_sp_a, dists], axis=1).astype(np.float32)
+    return start_frame, end_frame, features
 
 
 class ViolationDataset(Dataset):
     def __init__(
         self,
         labels: List[ViolationLabel],
-        video_paths: Dict[str, Path],
-        parquet_paths: Dict[str, Path],
-        context_frames: int = 16,
+        traj_data: Dict[Tuple[str, int, str], np.ndarray],
         num_frames: int = 32,
-        img_size: tuple = (224, 224),
-        transform=None
     ):
         self.labels = labels
-        self.video_paths = video_paths
-        self.parquet_paths = parquet_paths
-        self.context_frames = context_frames
+        self.traj_data = traj_data
         self.num_frames = num_frames
-        self.img_size = img_size
-        
-        self.transform = transform or transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize(img_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        
-        # Store parquet paths only, load on demand to save memory
-        self._parquet_cache = {}
+
         logger.info(f"Initialized dataset with {len(labels)} samples")
-    
-    def _get_parquet_data(self, video_id: str) -> Optional[pd.DataFrame]:
-        """Lazy load parquet data on demand."""
-        if video_id in self._parquet_cache:
-            return self._parquet_cache[video_id]
-        
-        if video_id not in self.parquet_paths:
-            return None
-        
-        try:
-            df = pd.read_parquet(self.parquet_paths[video_id])
-            self._parquet_cache[video_id] = df
-            return df
-        except Exception as e:
-            logger.warning(f"Could not load parquet for {video_id}: {e}")
-            return None
-    
+
     def __len__(self):
         return len(self.labels)
-    
+
     def __getitem__(self, idx):
-        logger.debug(f"__getitem__ called for idx={idx}")
         label = self.labels[idx]
-        logger.debug(f"  video_id={label.video_id}, tracking_id={label.tracking_id}, frames={label.start_frame}-{label.end_frame}")
-        
-        logger.debug("  Loading video clip...")
-        video_clip = self._load_video_clip(
-            label.video_id,
-            label.start_frame,
-            label.end_frame
-        )
-        logger.debug(f"  Video clip loaded: {video_clip.shape}")
-        
-        logger.debug("  Loading trajectory...")
-        trajectory = self._get_trajectory_clip(
-            label.video_id,
-            label.tracking_id,
-            label.start_frame,
-            label.end_frame
-        )
-        logger.debug(f"  Trajectory loaded: {trajectory.shape}")
-        
-        result = {
-            'frames': video_clip,
+        trajectory = self._get_trajectory(label.video_id, label.tracking_id, label.roi)
+
+        return {
             'trajectory': trajectory,
-            'label': torch.tensor(label.violation_type, dtype=torch.long),
+            'label': torch.tensor(label.annotation, dtype=torch.long),
             'video_id': label.video_id,
             'tracking_id': label.tracking_id,
-            'start_frame': label.start_frame
+            'start_frame': label.start_frame,
         }
-        logger.debug(f"  __getitem__ returning for idx={idx}")
-        return result
-    
-    def _load_video_clip(self, video_id: str, start: int, end: int):
-        """Load only the sampled frames from video (not the entire range)."""
-        if video_id not in self.video_paths:
-            raise ValueError(f"Video {video_id} not found in video_paths")
 
-        video_path = self.video_paths[video_id]
-        cap = cv2.VideoCapture(str(video_path))
-
-        if not cap.isOpened():
-            logger.error(f"Failed to open video: {video_path}")
-            zero_frames = torch.zeros((self.num_frames, 3, self.img_size[1], self.img_size[0]))
-            return zero_frames
-
-        try:
-            clip_start = max(0, start - self.context_frames)
-            clip_end = end + self.context_frames
-            total_clip_frames = clip_end - clip_start
-
-            if total_clip_frames <= 0:
-                return torch.zeros((self.num_frames, 3, self.img_size[1], self.img_size[0]))
-
-            # Compute which frame indices to sample BEFORE reading
-            if total_clip_frames >= self.num_frames:
-                sample_indices = np.linspace(0, total_clip_frames - 1, self.num_frames, dtype=int)
-            else:
-                # Repeat frames to fill num_frames
-                sample_indices = []
-                for _ in range(self.num_frames // total_clip_frames):
-                    sample_indices.extend(range(total_clip_frames))
-                sample_indices.extend(range(self.num_frames % total_clip_frames))
-                sample_indices = np.array(sample_indices, dtype=int)
-
-            # Only read the unique frames we actually need
-            unique_indices = sorted(set(sample_indices))
-
-            frames_by_idx = {}
-            zero_frame = np.zeros((self.img_size[1], self.img_size[0], 3), dtype=np.uint8)
-
-            for frame_idx in unique_indices:
-                abs_frame = clip_start + frame_idx
-                cap.set(cv2.CAP_PROP_POS_FRAMES, abs_frame)
-                ret, frame = cap.read()
-                if ret:
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    frames_by_idx[frame_idx] = self.transform(frame_rgb)
-                else:
-                    frames_by_idx[frame_idx] = self.transform(zero_frame)
-
-            # Assemble the final sequence in sample order
-            frames = [frames_by_idx[idx] for idx in sample_indices]
-            return torch.stack(frames, dim=0)
-        finally:
-            cap.release()
-    
-    def _get_trajectory_clip(self, video_id: str, tracking_id: int, start: int, end: int):
-        """Get trajectory data for frame range."""
-        df = self._get_parquet_data(video_id)
-        
-        if df is None:
+    def _get_trajectory(self, video_id: str, tracking_id: int, roi: str) -> torch.Tensor:
+        key = (video_id, tracking_id, roi)
+        features = self.traj_data.get(key)
+        if features is None:
+            logger.warning(f"No trajectory data for {key}, returning zeros")
             return torch.zeros((self.num_frames, 7), dtype=torch.float32)
-        
-        vehicle_mask = (df['v_track_id'] == tracking_id)
-        clip_df = df[vehicle_mask].copy()
-        
-        if len(clip_df) == 0:
-            return torch.zeros((self.num_frames, 7), dtype=torch.float32)
-        
-        clip_df = clip_df.iloc[0]
-        
-        v_loc = np.stack(clip_df['v_loc_planar'])
-        v_speed = np.array(clip_df['v_speed']).reshape(-1, 1)
-        p_loc = np.stack(clip_df['p_loc_planar'])
-        p_speed = np.array(clip_df['p_speed']).reshape(-1, 1)
-        
-        distances = np.linalg.norm(v_loc - p_loc, axis=1, keepdims=True)
-        
-        features = np.concatenate([v_loc, v_speed, p_loc, p_speed, distances], axis=1)
-        
-        sampled_features = self._sample_trajectory(features)
-        
-        return torch.from_numpy(sampled_features).float()
-    
-    def _sample_frames(self, frames_tensor):
-        """Sample frames to match num_frames."""
-        total_frames = frames_tensor.shape[0]
-        
-        if total_frames == self.num_frames:
-            return frames_tensor
-        elif total_frames > self.num_frames:
-            indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int)
-            return frames_tensor[indices]
-        else:
-            indices = []
-            for _ in range(self.num_frames // total_frames):
-                indices.extend(range(total_frames))
-            indices.extend(range(self.num_frames % total_frames))
-            return frames_tensor[indices]
-    
-    def _sample_trajectory(self, features):
-        """Sample trajectory to match num_frames."""
-        total_timesteps = features.shape[0]
-        
-        if total_timesteps == self.num_frames:
+        return torch.from_numpy(self._sample_trajectory(features))
+
+    def _sample_trajectory(self, features: np.ndarray) -> np.ndarray:
+        T = features.shape[0]
+        if T == self.num_frames:
             return features
-        elif total_timesteps > self.num_frames:
-            indices = np.linspace(0, total_timesteps - 1, self.num_frames, dtype=int)
-            return features[indices]
+        elif T > self.num_frames:
+            idx = np.linspace(0, T - 1, self.num_frames, dtype=int)
         else:
-            repeat_factor = self.num_frames // total_timesteps
-            remainder = self.num_frames % total_timesteps
-            indices = list(range(total_timesteps)) * repeat_factor + list(range(remainder))
-            return features[indices]
-        
+            repeat = self.num_frames // T
+            rem = self.num_frames % T
+            idx = list(range(T)) * repeat + list(range(rem))
+        return features[idx]
+
 
 def load_violation_dataset(
     data_root: Path,
-    split: str = 'train',
-    context_frames: int = 16,
+    label_file: str = 'train',
     num_frames: int = 32,
-    img_size: tuple = (224, 224),
-    transform=None
-):
+    video_filter: Optional[str] = None,
+) -> 'ViolationDataset':
+    """Load ViolationDataset from ATLAS data root.
+
+    Args:
+        data_root:     ATLAS project root (contains data/).
+        label_file:    'train' or 'test' — selects {label_file}_labels.pkl.
+        video_filter:  If set (e.g. 'video_001'), restrict to that video only.
+    """
     data_root = Path(data_root)
-    
-    label_file = data_root / 'data' / 'interim' / 'labels' / f'spatial_labels_{split}.pkl'
-    with open(label_file, 'rb') as f:
-        label_strings = pickle.load(f)
-    
-    labels = [parse_spatial_label(s) for s in label_strings]
-    logger.info(f"Loaded {len(labels)} {split} labels")
-    
-    video_dir = data_root / 'data' / 'raw' / 'video'
+
+    # 1. Load label strings
+    pkl_path = data_root / 'data' / 'raw' / 'labels' / f'{label_file}_labels.pkl'
+    with open(pkl_path, 'rb') as f:
+        label_strings, _ = pickle.load(f)
+    logger.info(f"Loaded {len(label_strings)} raw label strings from {pkl_path.name}")
+
+    # 2. Parse labels, optionally filter by video
+    parsed = []
+    for s in label_strings:
+        try:
+            vid, tid, roi, ann = parse_train_label(s)
+            if video_filter and vid != video_filter:
+                continue
+            parsed.append((vid, tid, roi, ann))
+        except Exception as e:
+            logger.warning(f"Skipping unparseable label {s!r}: {e}")
+    logger.info(f"Parsed {len(parsed)} labels" + (f" (filtered to {video_filter})" if video_filter else ""))
+
+    # 3. Load parquet for each unique video, build trajectory + frame-range cache
+    video_ids = sorted({p[0] for p in parsed})
     parquet_dir = data_root / 'data' / 'processed' / 'interactions'
-    
-    video_paths = {p.stem: p for p in video_dir.glob('*.avi')}
-    parquet_paths = {
-        p.stem.replace(f'_interactions_{split}', ''): p 
-        for p in parquet_dir.glob(f'*_interactions_{split}.parquet')
-    }
-    
-    logger.info(f"Found {len(video_paths)} videos, {len(parquet_paths)} parquet files")
-    
+
+    traj_data: Dict[Tuple[str, int, str], np.ndarray] = {}
+    frame_ranges: Dict[Tuple[str, int, str], Tuple[int, int]] = {}
+
+    for vid in video_ids:
+        parquet_path = parquet_dir / f'{vid}_interactions.parquet'
+        if not parquet_path.exists():
+            logger.warning(f"Parquet not found for {vid}: {parquet_path}")
+            continue
+        df = pd.read_parquet(parquet_path)
+        for (v_track_id, roi), group in df.groupby(['v_track_id', 'roi']):
+            key = (vid, int(v_track_id), str(roi))
+            try:
+                s, e, features = _build_group_trajectory(group)
+                traj_data[key] = features
+                frame_ranges[key] = (s, e)
+            except Exception as ex:
+                logger.warning(f"Could not build trajectory for {key}: {ex}")
+
+    logger.info(f"Built trajectory cache: {len(traj_data)} (video, track, roi) groups")
+
+    # 4. Build ViolationLabel list (skip labels with no parquet data)
+    labels = []
+    skipped = 0
+    for vid, tid, roi, ann in parsed:
+        key = (vid, tid, roi)
+        if key not in frame_ranges:
+            logger.warning(f"No parquet group for {key}, skipping")
+            skipped += 1
+            continue
+        s, e = frame_ranges[key]
+        labels.append(ViolationLabel(
+            video_id=vid,
+            tracking_id=tid,
+            roi=roi,
+            start_frame=s,
+            end_frame=e,
+            annotation=ann,
+        ))
+    logger.info(f"Final dataset: {len(labels)} samples ({skipped} skipped due to missing parquet)")
+
     return ViolationDataset(
         labels=labels,
-        video_paths=video_paths,
-        parquet_paths=parquet_paths,
-        context_frames=context_frames,
+        traj_data=traj_data,
         num_frames=num_frames,
-        img_size=img_size,
-        transform=transform
     )
-

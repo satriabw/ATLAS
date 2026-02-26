@@ -1,5 +1,4 @@
-from .vision_encoder import VisionEncoder
 from .trajectory_encoder import TrajectoryEncoder
-from .fusion_model import MultiModalFusionModel
+from .fusion_model import TrajectoryOnlyModel
 
-__all__ = ['VisionEncoder', 'TrajectoryEncoder', 'MultiModalFusionModel']
+__all__ = ['TrajectoryEncoder', 'TrajectoryOnlyModel']
