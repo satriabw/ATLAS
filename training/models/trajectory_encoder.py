@@ -2,14 +2,19 @@ import torch.nn as nn
 
 
 class TrajectoryEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, input_dim: int = 3, hidden_dim: int = 128):
         super().__init__()
-        self.gru = nn.GRU(input_size=7, hidden_size=128,
-                          num_layers=2, batch_first=True, dropout=0.3)
-        self.output_dim = 128
+        # Bidirectional GRU: hidden_size = hidden_dim // 2 so output is hidden_dim
+        self.gru = nn.GRU(
+            input_size=input_dim,
+            hidden_size=hidden_dim // 2,
+            num_layers=2,
+            batch_first=True,
+            dropout=0.3,
+            bidirectional=True,
+        )
+        self.output_dim = hidden_dim  # (hidden_dim//2) * 2 directions
 
     def forward(self, x):
-        # x: (B, T, 7)
-        _, hidden = self.gru(x)
-        # hidden: (num_layers, B, 128) — take last layer
-        return hidden[-1]
+        output, _ = self.gru(x)
+        return output  # (B, T, hidden_dim)

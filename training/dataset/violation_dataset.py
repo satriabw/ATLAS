@@ -6,7 +6,7 @@ import pickle
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -23,11 +23,6 @@ class ViolationLabel:
 
 
 def parse_train_label(label_str: str) -> Tuple[str, int, str, int]:
-    """Parse 'V001I00002S1D0R0A1' -> (video_id, tracking_id, roi, annotation).
-
-    S1 = BOT, S0 = TOP
-    A0 = violation, A1 = compliance
-    """
     m = re.match(r'V(\d+)I(\d+)S(\d)D\d+R\d+A(\d)', label_str)
     if not m:
         raise ValueError(f"Cannot parse label string: {label_str!r}")
@@ -39,7 +34,6 @@ def parse_train_label(label_str: str) -> Tuple[str, int, str, int]:
 
 
 def _to_loc(val) -> np.ndarray:
-    """Convert object array of (2,) coord arrays to (T, 2) float32 ndarray."""
     arr = np.asarray(val)
     if arr.dtype == object:
         return np.stack(arr.tolist()).astype(np.float32)
@@ -47,67 +41,60 @@ def _to_loc(val) -> np.ndarray:
 
 
 def _to_scalar_seq(val) -> np.ndarray:
-    """Convert speed/distance sequence to (T,) float32 ndarray."""
     return np.asarray(val, dtype=np.float32).ravel()
 
 
 def _to_frames(val) -> np.ndarray:
-    """Convert frame index sequence to (T,) int64 ndarray."""
     return np.asarray(val, dtype=np.int64).ravel()
 
 
 def _build_group_trajectory(
     group_df: pd.DataFrame,
-) -> Tuple[int, int, np.ndarray]:
-    """Build trajectory for one (v_track_id, roi) group.
+) -> Tuple[int, int, np.ndarray, np.ndarray]:
+    """Build separate vehicle and pedestrian trajectories for one (v_track_id, roi) group.
 
-    Frame range  = min/max across ALL rows in group.
-    Trajectory   = first pedestrian (earliest-appearing p_track_id) only,
-                   rows concatenated in frame order.
-
-    Returns (start_frame, end_frame, features) where features is (T, 7):
-        [v_loc_x, v_loc_y, v_speed, p_loc_x, p_loc_y, p_speed, v_p_distance]
+    Returns (start_frame, end_frame, vehicle_feat, ped_feat) where each feat is (T, 3):
+        vehicle_feat: [v_loc_x, v_loc_y, v_speed]
+        ped_feat:     [p_loc_x, p_loc_y, p_speed]
     """
     group_df = group_df.copy()
     group_df['_first_frame'] = group_df['frames'].apply(lambda f: int(_to_frames(f)[0]))
     group_df = group_df.sort_values('_first_frame').reset_index(drop=True)
 
-    # Frame range from ALL rows
     all_frames_flat = np.concatenate([_to_frames(row['frames']) for _, row in group_df.iterrows()])
     start_frame = int(all_frames_flat.min())
     end_frame = int(all_frames_flat.max())
 
-    # Pick first pedestrian by chronological order
     first_ped = int(group_df.iloc[0]['p_track_id'])
     ped_rows = group_df[group_df['p_track_id'] == first_ped]
 
-    # Concatenate trajectory data across matching rows
     frames_parts, v_loc_parts, v_sp_parts, p_loc_parts, p_sp_parts = [], [], [], [], []
     for _, row in ped_rows.iterrows():
         frames_parts.append(_to_frames(row['frames']))
-        v_loc_parts.append(_to_loc(row['v_loc_planar']))    # (N, 2)
-        v_sp_parts.append(_to_scalar_seq(row['v_speed']))   # (N,)
-        p_loc_parts.append(_to_loc(row['p_loc_planar']))    # (N, 2)
-        p_sp_parts.append(_to_scalar_seq(row['p_speed']))   # (N,)
+        v_loc_parts.append(_to_loc(row['v_loc_planar']))
+        v_sp_parts.append(_to_scalar_seq(row['v_speed']))
+        p_loc_parts.append(_to_loc(row['p_loc_planar']))
+        p_sp_parts.append(_to_scalar_seq(row['p_speed']))
 
     all_f = np.concatenate(frames_parts)
     order = np.argsort(all_f, kind='stable')
 
-    v_loc_a = np.vstack(v_loc_parts)[order]                    # (T, 2)
-    v_sp_a = np.concatenate(v_sp_parts)[order].reshape(-1, 1)  # (T, 1)
-    p_loc_a = np.vstack(p_loc_parts)[order]                    # (T, 2)
-    p_sp_a = np.concatenate(p_sp_parts)[order].reshape(-1, 1)  # (T, 1)
-    dists = np.linalg.norm(v_loc_a - p_loc_a, axis=1, keepdims=True)  # (T, 1)
+    v_loc_a = np.vstack(v_loc_parts)[order]
+    v_sp_a = np.concatenate(v_sp_parts)[order].reshape(-1, 1)
+    p_loc_a = np.vstack(p_loc_parts)[order]
+    p_sp_a = np.concatenate(p_sp_parts)[order].reshape(-1, 1)
 
-    features = np.concatenate([v_loc_a, v_sp_a, p_loc_a, p_sp_a, dists], axis=1).astype(np.float32)
-    return start_frame, end_frame, features
+    vehicle_feat = np.concatenate([v_loc_a, v_sp_a], axis=1).astype(np.float32)  # (T, 3)
+    ped_feat = np.concatenate([p_loc_a, p_sp_a], axis=1).astype(np.float32)      # (T, 3)
+
+    return start_frame, end_frame, vehicle_feat, ped_feat
 
 
 class ViolationDataset(Dataset):
     def __init__(
         self,
         labels: List[ViolationLabel],
-        traj_data: Dict[Tuple[str, int, str], np.ndarray],
+        traj_data: Dict[Tuple[str, int, str], Tuple[np.ndarray, np.ndarray]],
         num_frames: int = 32,
     ):
         self.labels = labels
@@ -121,25 +108,37 @@ class ViolationDataset(Dataset):
 
     def __getitem__(self, idx):
         label = self.labels[idx]
-        trajectory = self._get_trajectory(label.video_id, label.tracking_id, label.roi)
-
+        vehicle_feat, ped_feat, has_pedestrian = self._get_modalities(
+            label.video_id, label.tracking_id, label.roi
+        )
         return {
-            'trajectory': trajectory,
+            'vehicle_feat': vehicle_feat,
+            'ped_feat': ped_feat,
+            'has_pedestrian': torch.tensor(has_pedestrian, dtype=torch.bool),
             'label': torch.tensor(label.annotation, dtype=torch.long),
             'video_id': label.video_id,
             'tracking_id': label.tracking_id,
             'start_frame': label.start_frame,
         }
 
-    def _get_trajectory(self, video_id: str, tracking_id: int, roi: str) -> torch.Tensor:
+    def _get_modalities(
+        self, video_id: str, tracking_id: int, roi: str
+    ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
         key = (video_id, tracking_id, roi)
-        features = self.traj_data.get(key)
-        if features is None:
+        entry = self.traj_data.get(key)
+        if entry is None:
             logger.warning(f"No trajectory data for {key}, returning zeros")
-            return torch.zeros((self.num_frames, 7), dtype=torch.float32)
-        return torch.from_numpy(self._sample_trajectory(features))
+            zeros = torch.zeros((self.num_frames, 3), dtype=torch.float32)
+            return zeros, zeros, False
 
-    def _sample_trajectory(self, features: np.ndarray) -> np.ndarray:
+        vehicle_feat, ped_feat = entry
+        return (
+            torch.from_numpy(self._resample(vehicle_feat)),
+            torch.from_numpy(self._resample(ped_feat)),
+            True,
+        )
+
+    def _resample(self, features: np.ndarray) -> np.ndarray:
         T = features.shape[0]
         if T == self.num_frames:
             return features
@@ -156,40 +155,32 @@ def load_violation_dataset(
     data_root: Path,
     label_file: str = 'train',
     num_frames: int = 32,
-    video_filter: Optional[str] = None,
-) -> 'ViolationDataset':
-    """Load ViolationDataset from ATLAS data root.
-
-    Args:
-        data_root:     ATLAS project root (contains data/).
-        label_file:    'train' or 'test' — selects {label_file}_labels.pkl.
-        video_filter:  If set (e.g. 'video_001'), restrict to that video only.
-    """
+    video_filter: Optional[Union[str, List[str]]] = None,
+) -> ViolationDataset:
     data_root = Path(data_root)
 
-    # 1. Load label strings
     pkl_path = data_root / 'data' / 'raw' / 'labels' / f'{label_file}_labels.pkl'
     with open(pkl_path, 'rb') as f:
         label_strings, _ = pickle.load(f)
     logger.info(f"Loaded {len(label_strings)} raw label strings from {pkl_path.name}")
 
-    # 2. Parse labels, optionally filter by video
+    allowed = ({video_filter} if isinstance(video_filter, str)
+               else set(video_filter) if video_filter else None)
     parsed = []
     for s in label_strings:
         try:
             vid, tid, roi, ann = parse_train_label(s)
-            if video_filter and vid != video_filter:
+            if allowed and vid not in allowed:
                 continue
             parsed.append((vid, tid, roi, ann))
         except Exception as e:
             logger.warning(f"Skipping unparseable label {s!r}: {e}")
     logger.info(f"Parsed {len(parsed)} labels" + (f" (filtered to {video_filter})" if video_filter else ""))
 
-    # 3. Load parquet for each unique video, build trajectory + frame-range cache
     video_ids = sorted({p[0] for p in parsed})
     parquet_dir = data_root / 'data' / 'processed' / 'interactions'
 
-    traj_data: Dict[Tuple[str, int, str], np.ndarray] = {}
+    traj_data: Dict[Tuple[str, int, str], Tuple[np.ndarray, np.ndarray]] = {}
     frame_ranges: Dict[Tuple[str, int, str], Tuple[int, int]] = {}
 
     for vid in video_ids:
@@ -201,15 +192,14 @@ def load_violation_dataset(
         for (v_track_id, roi), group in df.groupby(['v_track_id', 'roi']):
             key = (vid, int(v_track_id), str(roi))
             try:
-                s, e, features = _build_group_trajectory(group)
-                traj_data[key] = features
+                s, e, vehicle_feat, ped_feat = _build_group_trajectory(group)
+                traj_data[key] = (vehicle_feat, ped_feat)
                 frame_ranges[key] = (s, e)
             except Exception as ex:
                 logger.warning(f"Could not build trajectory for {key}: {ex}")
 
     logger.info(f"Built trajectory cache: {len(traj_data)} (video, track, roi) groups")
 
-    # 4. Build ViolationLabel list (skip labels with no parquet data)
     labels = []
     skipped = 0
     for vid, tid, roi, ann in parsed:
@@ -229,8 +219,4 @@ def load_violation_dataset(
         ))
     logger.info(f"Final dataset: {len(labels)} samples ({skipped} skipped due to missing parquet)")
 
-    return ViolationDataset(
-        labels=labels,
-        traj_data=traj_data,
-        num_frames=num_frames,
-    )
+    return ViolationDataset(labels=labels, traj_data=traj_data, num_frames=num_frames)
