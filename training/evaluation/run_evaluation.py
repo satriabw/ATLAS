@@ -207,7 +207,7 @@ def main() -> None:
     parser.add_argument(
         "--labels-pkl",
         type=Path,
-        default=Path("/home/satria/Project/ATLAS/data/raw/labels/train_labels.pkl"),
+        default=Path("/home/satria/Project/ATLAS/data/raw/labels/test_labels.pkl"),
         help="Path to labels pkl (train_labels.pkl or test_labels.pkl)",
     )
     parser.add_argument(

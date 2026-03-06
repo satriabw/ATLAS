@@ -1,9 +1,7 @@
 import gc
 import torch
-import torch.nn.functional as F
 import argparse
 import logging
-import numpy as np
 from collections import defaultdict
 from pathlib import Path
 from torch.utils.data import DataLoader, Subset, random_split
@@ -12,12 +10,34 @@ from tqdm import tqdm
 
 from dataset.violation_dataset import load_violation_dataset
 from models import CrossAttentionModel
+from evaluation.evaluate_model import build_events_with_scores
+from evaluation.run_evaluation import build_gt_events
+from evaluation.ap_calculator import compute_map
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def compute_val_ap(model, device, data_root: Path, val_video_ids: list) -> dict:
+    """Compute APv/APn/mAP on val videos using the full evaluation pipeline."""
+    parquet_dir = data_root / 'data' / 'processed' / 'interactions'
+    labels_pkl  = data_root / 'data' / 'raw' / 'labels' / 'train_labels.pkl'
+    nan_result  = {'APv': float('nan'), 'APn': float('nan'), 'mAP': float('nan')}
+
+    if not labels_pkl.exists():
+        logger.warning("Labels pkl not found, skipping AP computation")
+        return nan_result
+
+    predictions = build_events_with_scores(parquet_dir, val_video_ids, model, device)
+    if not predictions:
+        logger.warning("No predictions built for AP computation")
+        return nan_result
+
+    gt_events = build_gt_events(labels_pkl, val_video_ids, predictions)
+    return compute_map(predictions, gt_events)
 
 
 def train_epoch(model, dataloader, criterion, optimizer, device, scaler, accumulation_steps=4):
@@ -56,32 +76,14 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, accumul
     return avg_loss, accuracy
 
 
-def _compute_ap(scores: np.ndarray, labels: np.ndarray, pos_class: int) -> float:
-    """Per-sample PR-AUC for one class. scores: prob of pos_class per sample."""
-    n_pos = (labels == pos_class).sum()
-    if n_pos == 0:
-        return float('nan')
-    order = np.argsort(scores)[::-1]
-    sorted_labels = labels[order]
-    tp = np.cumsum(sorted_labels == pos_class).astype(np.float64)
-    fp = np.cumsum(sorted_labels != pos_class).astype(np.float64)
-    prec = tp / (tp + fp)
-    rec = tp / n_pos
-    prec = np.concatenate([[1.0], prec])
-    rec = np.concatenate([[0.0], rec])
-    return float(np.trapz(prec, rec))
-
-
 def validate(model, dataloader, criterion, device):
     if len(dataloader) == 0:
-        return float('nan'), float('nan'), float('nan'), float('nan')
+        return float('nan'), float('nan')
 
     model.eval()
     total_loss = 0
     correct = 0
     total = 0
-    all_probs = []
-    all_labels = []
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Validation"):
@@ -99,20 +101,10 @@ def validate(model, dataloader, criterion, device):
             correct += (predicted == labels).sum().item()
             total += labels.size(0)
 
-            probs = F.softmax(logits.float(), dim=1)
-            all_probs.append(probs.cpu().numpy())
-            all_labels.append(labels.cpu().numpy())
-
     avg_loss = total_loss / len(dataloader)
     accuracy = 100 * correct / total
 
-    all_probs = np.concatenate(all_probs, axis=0)   # (N, 2)
-    all_labels = np.concatenate(all_labels, axis=0)  # (N,)
-    # Training convention: label 0 = violation, label 1 = compliance
-    apv = _compute_ap(all_probs[:, 0], all_labels, pos_class=0)
-    apn = _compute_ap(all_probs[:, 1], all_labels, pos_class=1)
-
-    return avg_loss, accuracy, apv, apn
+    return avg_loss, accuracy
 
 
 def train(args, train_dataset, val_dataset, criterion):
@@ -137,10 +129,21 @@ def train(args, train_dataset, val_dataset, criterion):
     scaler = GradScaler()
 
     num_epochs = args.epochs
-    best_val_acc = 0
+    best_val_apv = -1.0
+    best_val_acc = 0.0
 
     checkpoint_dir = Path(__file__).parent / 'checkpoints'
     checkpoint_dir.mkdir(exist_ok=True)
+
+    # Extract unique video IDs from val dataset for AP evaluation
+    if hasattr(val_dataset, 'indices'):
+        val_labels = [val_dataset.dataset.labels[i] for i in val_dataset.indices]
+    else:
+        val_labels = val_dataset.labels
+    val_video_ids = sorted(set(lbl.video_id for lbl in val_labels))
+    logger.info(f"Val video IDs for AP: {val_video_ids}")
+
+    data_root = Path(args.data_root)
 
     logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
@@ -148,17 +151,22 @@ def train(args, train_dataset, val_dataset, criterion):
         logger.info(f"Epoch {epoch+1}/{num_epochs}")
 
         train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, scaler, accumulation_steps)
-        val_loss, val_acc, apv, apn = validate(model, val_loader, criterion, device)
+        val_loss, val_acc = validate(model, val_loader, criterion, device)
 
         logger.info(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
         if val_loss == val_loss:  # not nan
-            map_ = (apv + apn) / 2 if apv == apv and apn == apn else float('nan')
-            logger.info(
-                f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%  |  "
-                f"APv: {apv:.3f}, APn: {apn:.3f}, mAP: {map_:.3f}"
-            )
+            logger.info(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
         else:
             logger.info("Val Loss: N/A (empty val set)")
+
+        ap_result = compute_val_ap(model, device, data_root, val_video_ids)
+        apv = ap_result['APv']
+        apn = ap_result['APn']
+        mAP = ap_result['mAP']
+        if apv == apv:  # not nan
+            logger.info(f"APv: {apv:.3f}, APn: {apn:.3f}, mAP: {mAP:.3f}")
+        else:
+            logger.info("APv/APn: N/A (no parquet files for val videos)")
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -170,20 +178,32 @@ def train(args, train_dataset, val_dataset, criterion):
             reserved_gb = torch.cuda.memory_reserved() / 1024**3
             logger.info(f"CUDA Memory: Allocated={allocated_gb:.2f}GB, Reserved={reserved_gb:.2f}GB")
 
-        if val_acc == val_acc and val_acc > best_val_acc:
-            best_val_acc = val_acc
+        # Checkpoint on best APv; fall back to val_acc if APv is unavailable
+        use_apv = apv == apv  # True if not nan
+        should_save = (use_apv and apv > best_val_apv) or \
+                      (not use_apv and val_acc == val_acc and val_acc > best_val_acc)
+        if should_save:
+            if use_apv:
+                best_val_apv = apv
+            else:
+                best_val_acc = val_acc
             save_path = checkpoint_dir / ('overfit_model.pth' if args.overfit else 'best_model.pth')
-            # noqa: keep best_model.pth untouched during overfit runs
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_acc': val_acc,
                 'val_loss': val_loss,
+                'APv': apv,
+                'APn': apn,
+                'mAP': mAP,
             }, save_path)
-            logger.info(f"Saved best model to {save_path.name} with val acc: {val_acc:.2f}%")
+            if use_apv:
+                logger.info(f"Saved best model to {save_path.name} with APv: {apv:.3f}")
+            else:
+                logger.info(f"Saved best model to {save_path.name} with val acc: {val_acc:.2f}% (APv unavailable)")
 
-    logger.info(f"Training completed. Best validation accuracy: {best_val_acc:.2f}%")
+    logger.info(f"Training completed. Best APv: {best_val_apv:.3f}" if best_val_apv >= 0 else "Training completed.")
     return model
 
 
@@ -221,7 +241,7 @@ def main():
         compliance = all_labels.count(1)
         logger.info(f"Label distribution: Violations (0)={violations}, Compliance (1)={compliance}")
 
-        w = torch.tensor([2.0, 1.0], dtype=torch.float32, device=device)
+        w = torch.tensor([3.5, 1.0], dtype=torch.float32, device=device)
         criterion = torch.nn.CrossEntropyLoss(weight=w)
         logger.info(f"Class weights: violation={w[0]:.3f}, compliance={w[1]:.3f}")
 
@@ -263,7 +283,7 @@ def main():
         logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
         logger.info(f"Train label distribution: Violations (0)={violations}, Compliance (1)={compliance}")
 
-        w = torch.tensor([2.0, 1.0], dtype=torch.float32, device=device)
+        w = torch.tensor([3.5, 1.0], dtype=torch.float32, device=device)
         criterion = torch.nn.CrossEntropyLoss(weight=w)
         logger.info(f"Class weights: violation={w[0]:.3f}, compliance={w[1]:.3f}")
 

@@ -60,13 +60,21 @@ def match_predictions_to_gt(
     return annotated
 
 
-def compute_ap(matched_predictions: list[dict], target_class: int) -> float:
+def compute_ap(matched_predictions: list[dict], target_class: int, n_gt: int | None = None) -> float:
     """Compute AP for one class using a precision-recall curve.
 
     A prediction is a TP if:
         matched_label == target_class  AND  eiou > 0  (already encoded by matching)
 
     Predictions are sorted by 'score' descending.
+
+    Args:
+        matched_predictions: annotated prediction dicts.
+        target_class:        class index to compute AP for.
+        n_gt:                total number of GT events for this class.  If
+                             provided it is used as the recall denominator so
+                             that unmatched GT events are counted as FNs.
+                             Defaults to the number of matched TPs.
 
     Returns AP in [0, 1].
     """
@@ -76,7 +84,7 @@ def compute_ap(matched_predictions: list[dict], target_class: int) -> float:
     # Sort by score descending
     sorted_preds = sorted(matched_predictions, key=lambda p: p["score"], reverse=True)
 
-    n_pos = sum(1 for p in sorted_preds if p["matched_label"] == target_class)
+    n_pos = n_gt if n_gt is not None else sum(1 for p in sorted_preds if p["matched_label"] == target_class)
     if n_pos == 0:
         return 0.0
 
@@ -103,6 +111,45 @@ def compute_ap(matched_predictions: list[dict], target_class: int) -> float:
 
     ap = float(np.trapz(precisions, recalls))
     return max(0.0, min(1.0, ap))
+
+
+def compute_pr_curve(
+    matched_predictions: list[dict],
+    target_class: int,
+    n_gt: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (recalls, precisions) arrays for one class, sorted by recall.
+
+    Useful for plotting the PR curve.  Uses the same logic as compute_ap.
+
+    Args:
+        n_gt: total GT count for this class (used as recall denominator).
+              Defaults to matched TP count if not provided.
+    """
+    if not matched_predictions:
+        return np.array([0.0, 1.0]), np.array([1.0, 1.0])
+
+    sorted_preds = sorted(matched_predictions, key=lambda p: p["score"], reverse=True)
+    n_pos = n_gt if n_gt is not None else sum(1 for p in sorted_preds if p["matched_label"] == target_class)
+    if n_pos == 0:
+        return np.array([0.0, 1.0]), np.array([1.0, 1.0])
+
+    tp_cumsum = 0
+    fp_cumsum = 0
+    precisions = []
+    recalls    = []
+
+    for pred in sorted_preds:
+        if pred["matched_label"] == target_class:
+            tp_cumsum += 1
+        else:
+            fp_cumsum += 1
+        precisions.append(tp_cumsum / (tp_cumsum + fp_cumsum))
+        recalls.append(tp_cumsum / n_pos)
+
+    precisions = np.concatenate([[1.0], precisions])
+    recalls    = np.concatenate([[0.0], recalls])
+    return recalls, precisions
 
 
 def compute_map(
@@ -136,8 +183,12 @@ def compute_map(
             p2["matched_label"] = -1   # weak match → FP for both classes
         thresholded.append(p2)
 
-    apv = compute_ap(thresholded, target_class=1)   # violation = 1
-    apn = compute_ap(thresholded, target_class=0)   # non-violation = 0
+    # Use total GT counts so unmatched GT events count as FNs in recall.
+    n_gt_v = sum(1 for g in ground_truth if g["label"] == 1)
+    n_gt_n = sum(1 for g in ground_truth if g["label"] == 0)
+
+    apv = compute_ap(thresholded, target_class=1, n_gt=n_gt_v)   # violation = 1
+    apn = compute_ap(thresholded, target_class=0, n_gt=n_gt_n)   # non-violation = 0
     map_ = (apv + apn) / 2.0
 
     return {"APv": apv, "APn": apn, "mAP": map_}

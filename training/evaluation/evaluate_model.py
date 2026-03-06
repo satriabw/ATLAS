@@ -167,7 +167,7 @@ def main() -> None:
     parser.add_argument("--parquet-dir",   type=Path,
                         default=Path("/home/satria/Project/ATLAS/data/processed/interactions"))
     parser.add_argument("--labels-pkl",    type=Path,
-                        default=Path("/home/satria/Project/ATLAS/data/raw/labels/train_labels.pkl"))
+                        default=Path("/home/satria/Project/ATLAS/data/raw/labels/test_labels.pkl"))
     parser.add_argument("--video-ids",     nargs="+", type=int,
                         default=list(range(2, 121, 2)),
                         help="Video numbers (even = test split, 2,4,...,120)")

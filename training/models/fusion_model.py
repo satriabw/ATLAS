@@ -20,5 +20,5 @@ class CrossAttentionModel(nn.Module):
         vehicle_enc = self.vehicle_encoder(vehicle_feat)  # (B, T, 128)
         ped_enc = self.ped_encoder(ped_feat)              # (B, T, 128)
         attended, _ = self.cross_attn(query=vehicle_enc, key=ped_enc, value=ped_enc)
-        pooled = attended.mean(dim=1)                     # (B, 128)
+        pooled = attended.max(dim=1).values               # (B, 128)
         return self.classifier(pooled)
