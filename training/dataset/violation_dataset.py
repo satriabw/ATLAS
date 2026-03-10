@@ -84,8 +84,12 @@ def _build_group_trajectory(
     p_loc_a = np.vstack(p_loc_parts)[order]
     p_sp_a = np.concatenate(p_sp_parts)[order].reshape(-1, 1)
 
-    vehicle_feat = np.concatenate([v_loc_a, v_sp_a], axis=1).astype(np.float32)  # (T, 3)
-    ped_feat = np.concatenate([p_loc_a, p_sp_a], axis=1).astype(np.float32)      # (T, 3)
+    v_origin = v_loc_a[0:1]          # (1, 2) — first vehicle position
+    v_centered = v_loc_a - v_origin  # vehicle trajectory centered at t=0
+    p_rel_loc = p_loc_a - v_loc_a    # pedestrian position relative to vehicle (unchanged)
+
+    vehicle_feat = np.concatenate([v_centered, v_sp_a], axis=1).astype(np.float32)  # (T, 3)
+    ped_feat = np.concatenate([p_rel_loc, p_sp_a], axis=1).astype(np.float32)    # (T, 3)
 
     return start_frame, end_frame, vehicle_feat, ped_feat
 
@@ -132,9 +136,13 @@ class ViolationDataset(Dataset):
             return zeros, zeros, False
 
         vehicle_feat, ped_feat = entry
+        vehicle_feat = self._resample(vehicle_feat)
+        ped_feat = self._resample(ped_feat)
+        vehicle_feat = self._zscore_speed(vehicle_feat)
+        ped_feat = self._zscore_speed(ped_feat)
         return (
-            torch.from_numpy(self._resample(vehicle_feat)),
-            torch.from_numpy(self._resample(ped_feat)),
+            torch.from_numpy(vehicle_feat),
+            torch.from_numpy(ped_feat),
             True,
         )
 
@@ -149,6 +157,15 @@ class ViolationDataset(Dataset):
             rem = self.num_frames % T
             idx = list(range(T)) * repeat + list(range(rem))
         return features[idx]
+
+    def _zscore_speed(self, features: np.ndarray) -> np.ndarray:
+        """Z-score normalize the speed column (index 2) in-place on a copy."""
+        features = features.copy()
+        speed = features[:, 2]
+        mean = speed.mean()
+        std = speed.std()
+        features[:, 2] = (speed - mean) / (std + 1e-6)
+        return features
 
 
 def load_violation_dataset(
