@@ -90,18 +90,61 @@ def _build_group_trajectory(
     return start_frame, end_frame, vehicle_feat, ped_feat
 
 
+def compute_normalization_stats(
+    traj_data: Dict[Tuple[str, int, str], Tuple[np.ndarray, np.ndarray]],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute per-feature mean and std across all trajectories.
+
+    Returns (vehicle_mean, vehicle_std, ped_mean, ped_std), each shape (3,).
+    Features order: [loc_x, loc_y, speed]
+    """
+    v_all: List[np.ndarray] = []
+    p_all: List[np.ndarray] = []
+    for v_feat, p_feat in traj_data.values():
+        v_all.append(v_feat)
+        p_all.append(p_feat)
+
+    v_cat = np.concatenate(v_all, axis=0)  # (N_total, 3)
+    p_cat = np.concatenate(p_all, axis=0)
+
+    v_mean = v_cat.mean(axis=0).astype(np.float32)
+    v_std  = v_cat.std(axis=0).astype(np.float32)
+    p_mean = p_cat.mean(axis=0).astype(np.float32)
+    p_std  = p_cat.std(axis=0).astype(np.float32)
+
+    # Guard against zero std (constant features)
+    v_std = np.where(v_std < 1e-6, 1.0, v_std).astype(np.float32)
+    p_std = np.where(p_std < 1e-6, 1.0, p_std).astype(np.float32)
+
+    return v_mean, v_std, p_mean, p_std
+
+
 class ViolationDataset(Dataset):
     def __init__(
         self,
         labels: List[ViolationLabel],
         traj_data: Dict[Tuple[str, int, str], Tuple[np.ndarray, np.ndarray]],
         num_frames: int = 32,
+        norm_stats: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = None,
     ):
         self.labels = labels
         self.traj_data = traj_data
         self.num_frames = num_frames
 
-        logger.info(f"Initialized dataset with {len(labels)} samples")
+        if norm_stats is not None:
+            self.v_mean, self.v_std, self.p_mean, self.p_std = norm_stats
+        else:
+            self.v_mean, self.v_std, self.p_mean, self.p_std = compute_normalization_stats(traj_data)
+
+        logger.info(
+            f"Initialized dataset with {len(labels)} samples — "
+            f"v_mean={self.v_mean.round(3)}, v_std={self.v_std.round(3)}, "
+            f"p_mean={self.p_mean.round(3)}, p_std={self.p_std.round(3)}"
+        )
+
+    @property
+    def norm_stats(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        return (self.v_mean, self.v_std, self.p_mean, self.p_std)
 
     def __len__(self):
         return len(self.labels)
@@ -132,9 +175,11 @@ class ViolationDataset(Dataset):
             return zeros, zeros, False
 
         vehicle_feat, ped_feat = entry
+        v_norm = (self._resample(vehicle_feat) - self.v_mean) / self.v_std
+        p_norm = (self._resample(ped_feat)    - self.p_mean) / self.p_std
         return (
-            torch.from_numpy(self._resample(vehicle_feat)),
-            torch.from_numpy(self._resample(ped_feat)),
+            torch.from_numpy(v_norm.astype(np.float32)),
+            torch.from_numpy(p_norm.astype(np.float32)),
             True,
         )
 

@@ -65,6 +65,7 @@ def build_events_with_scores(
     device: torch.device,
     num_frames: int = 32,
     batch_size: int = 64,
+    norm_stats: tuple | None = None,
 ) -> list[dict]:
     """Build detected events with model-predicted violation probability as score.
 
@@ -72,7 +73,16 @@ def build_events_with_scores(
     Event label mapping:   label 1 = violation, label 0 = non-violation
 
     score = softmax(logits)[0]  →  P(violation)
+
+    norm_stats: optional (v_mean, v_std, p_mean, p_std) numpy arrays, each shape (3,).
+    If provided, z-score normalization is applied before inference (must match training).
     """
+    if norm_stats is not None:
+        v_mean, v_std, p_mean, p_std = norm_stats
+        logger.info("Applying normalization from checkpoint to inference trajectories")
+    else:
+        v_mean = v_std = p_mean = p_std = None
+
     model.eval()
     events: list[dict] = []
 
@@ -110,6 +120,11 @@ def build_events_with_scores(
                 _, _, vehicle_feat, ped_feat = _build_group_trajectory(group)
                 v_traj = _sample_trajectory(vehicle_feat, num_frames)  # (num_frames, 3)
                 p_traj = _sample_trajectory(ped_feat, num_frames)      # (num_frames, 3)
+
+                # Apply z-score normalization (must match training)
+                if v_mean is not None:
+                    v_traj = ((v_traj - v_mean) / v_std).astype(np.float32)
+                    p_traj = ((p_traj - p_mean) / p_std).astype(np.float32)
 
                 events.append({
                     "video_id":    vid,
@@ -190,10 +205,20 @@ def main() -> None:
     logger.info(f"Loaded checkpoint: {args.checkpoint.name}  "
                 f"(epoch {ckpt['epoch']}, val_acc={ckpt['val_acc']:.2f}%)")
 
+    # Load normalization stats saved during training (if available)
+    norm_stats = None
+    if "norm_stats" in ckpt:
+        ns = ckpt["norm_stats"]
+        norm_stats = (ns["v_mean"], ns["v_std"], ns["p_mean"], ns["p_std"])
+        logger.info("Loaded normalization stats from checkpoint")
+    else:
+        logger.warning("Checkpoint has no norm_stats — running without normalization")
+
     # Build events with model scores
     predictions = build_events_with_scores(
         args.parquet_dir, video_ids, model, device,
         num_frames=args.num_frames, batch_size=args.batch_size,
+        norm_stats=norm_stats,
     )
 
     # Build GT events (positions proxied from detected)

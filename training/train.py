@@ -21,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def compute_val_ap(model, device, data_root: Path, val_video_ids: list) -> dict:
+def compute_val_ap(model, device, data_root: Path, val_video_ids: list, norm_stats=None) -> dict:
     """Compute APv/APn/mAP on val videos using the full evaluation pipeline."""
     parquet_dir = data_root / 'data' / 'processed' / 'interactions'
     labels_pkl  = data_root / 'data' / 'raw' / 'labels' / 'train_labels.pkl'
@@ -31,7 +31,7 @@ def compute_val_ap(model, device, data_root: Path, val_video_ids: list) -> dict:
         logger.warning("Labels pkl not found, skipping AP computation")
         return nan_result
 
-    predictions = build_events_with_scores(parquet_dir, val_video_ids, model, device)
+    predictions = build_events_with_scores(parquet_dir, val_video_ids, model, device, norm_stats=norm_stats)
     if not predictions:
         logger.warning("No predictions built for AP computation")
         return nan_result
@@ -145,6 +145,11 @@ def train(args, train_dataset, val_dataset, criterion):
 
     data_root = Path(args.data_root)
 
+    # Extract normalization stats from the underlying dataset
+    base_dataset = train_dataset.dataset if hasattr(train_dataset, 'dataset') else train_dataset
+    norm_stats = base_dataset.norm_stats
+    logger.info(f"Normalization stats — v_mean={norm_stats[0].round(3)}, v_std={norm_stats[1].round(3)}")
+
     logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
     for epoch in range(num_epochs):
@@ -159,7 +164,7 @@ def train(args, train_dataset, val_dataset, criterion):
         else:
             logger.info("Val Loss: N/A (empty val set)")
 
-        ap_result = compute_val_ap(model, device, data_root, val_video_ids)
+        ap_result = compute_val_ap(model, device, data_root, val_video_ids, norm_stats=norm_stats)
         apv = ap_result['APv']
         apn = ap_result['APn']
         mAP = ap_result['mAP']
@@ -197,6 +202,12 @@ def train(args, train_dataset, val_dataset, criterion):
                 'APv': apv,
                 'APn': apn,
                 'mAP': mAP,
+                'norm_stats': {
+                    'v_mean': norm_stats[0],
+                    'v_std':  norm_stats[1],
+                    'p_mean': norm_stats[2],
+                    'p_std':  norm_stats[3],
+                },
             }, save_path)
             if use_apv:
                 logger.info(f"Saved best model to {save_path.name} with APv: {apv:.3f}")
