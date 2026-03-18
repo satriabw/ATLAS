@@ -19,51 +19,40 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import numpy as np
 import torch
-import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from evaluation.run_evaluation import build_gt_events
-from evaluation.ap_calculator import (
-    match_predictions_to_gt,
-    compute_pr_curve,
-    compute_ap,
-)
+from evaluation.ap_calculator import compute_ap, compute_pr_curve
 
 logger = logging.getLogger(__name__)
 
 
-def _apply_threshold(matched: list[dict], eiou_threshold: float) -> list[dict]:
-    thresholded = []
-    for p in matched:
-        p2 = dict(p)
-        if 0.0 < p2["eiou"] <= eiou_threshold:
-            p2["matched_label"] = -1
-        thresholded.append(p2)
-    return thresholded
-
-
 def plot_curves(
     predictions: list[dict],
-    gt_events: list[dict],
-    d_max: float = 5.0,
     eiou_threshold: float = 0.5,
     output_path: Path | None = None,
     show: bool = True,
 ) -> None:
-    matched = match_predictions_to_gt(predictions, gt_events, d_max=d_max)
-    thresholded = _apply_threshold(matched, eiou_threshold)
+    """Plot APv and APn PR curves from scored, labeled predictions.
 
-    n_gt_v = sum(1 for g in gt_events if g["label"] == 1)
-    n_gt_n = sum(1 for g in gt_events if g["label"] == 0)
+    Each prediction must have: gt_label, score, score_n, eiou.
+    """
+    # Apply EIoU threshold: zero scores for correct-class but poorly-localized events
+    thresholded = []
+    for p in predictions:
+        p2 = dict(p)
+        predicted_class = 1 if p2["score"] >= 0.5 else 0
+        if predicted_class == p2["gt_label"] and p2["eiou"] <= eiou_threshold:
+            p2["score"]   = 0.0
+            p2["score_n"] = 0.0
+        thresholded.append(p2)
 
-    recalls_v, precisions_v = compute_pr_curve(thresholded, target_class=1, n_gt=n_gt_v)
-    recalls_n, precisions_n = compute_pr_curve(thresholded, target_class=0, n_gt=n_gt_n)
+    recalls_v, precisions_v = compute_pr_curve(thresholded, target_class=1, score_key="score")
+    recalls_n, precisions_n = compute_pr_curve(thresholded, target_class=0, score_key="score_n")
 
-    apv = compute_ap(thresholded, target_class=1, n_gt=n_gt_v)
-    apn = compute_ap(thresholded, target_class=0, n_gt=n_gt_n)
+    apv = compute_ap(thresholded, target_class=1, score_key="score")
+    apn = compute_ap(thresholded, target_class=0, score_key="score_n")
     map_ = (apv + apn) / 2.0
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
@@ -95,7 +84,7 @@ def plot_curves(
 
 
 # ---------------------------------------------------------------------------
-# CLI — re-uses evaluate_model helpers for full model inference
+# CLI
 # ---------------------------------------------------------------------------
 
 def main() -> None:
@@ -109,18 +98,16 @@ def main() -> None:
                         default=Path("/home/satria/Project/ATLAS/data/raw/labels/test_labels.pkl"))
     parser.add_argument("--video-ids",      nargs="+", type=int,
                         default=list(range(2, 121, 2)))
-    parser.add_argument("--num-frames",     type=int, default=32)
-    parser.add_argument("--d-max",          type=float, default=5.0)
+    parser.add_argument("--num-frames",     type=int,   default=32)
     parser.add_argument("--eiou-threshold", type=float, default=0.5)
-    parser.add_argument("--batch-size",     type=int, default=64)
-    parser.add_argument("--output",         type=Path, default=Path("ap_curve.png"))
+    parser.add_argument("--batch-size",     type=int,   default=64)
+    parser.add_argument("--output",         type=Path,  default=Path("ap_curve.png"))
     parser.add_argument("--no-show",        action="store_true",
                         help="Skip interactive display (save only)")
     args = parser.parse_args()
 
     video_ids = [f"video_{n:03d}" for n in args.video_ids]
 
-    # Import here to avoid circular deps when used as a library
     from evaluation.evaluate_model import build_events_with_scores
     from models import CrossAttentionModel
 
@@ -131,14 +118,12 @@ def main() -> None:
     logger.info(f"Loaded {args.checkpoint.name}  epoch={ckpt['epoch']}  val_acc={ckpt['val_acc']:.2f}%")
 
     predictions = build_events_with_scores(
-        args.parquet_dir, video_ids, model, device,
+        args.parquet_dir, args.labels_pkl, video_ids, model, device,
         num_frames=args.num_frames, batch_size=args.batch_size,
     )
-    gt_events = build_gt_events(args.labels_pkl, video_ids, predictions)
 
     plot_curves(
-        predictions, gt_events,
-        d_max=args.d_max,
+        predictions,
         eiou_threshold=args.eiou_threshold,
         output_path=args.output,
         show=not args.no_show,

@@ -33,7 +33,7 @@ video  track  roi         annotation
         ↓
 3. For each unique video, load its .parquet file
    Group rows by (v_track_id, roi)
-   For each group → build_group_trajectory()
+   For each group → _build_group_trajectory()
         ↓
 4. Build ViolationLabel list (skip if no matching parquet group)
         ↓
@@ -45,31 +45,46 @@ video  track  roi         annotation
 Each `(v_track_id, roi)` group can span multiple parquet rows. The function:
 - Picks the **first pedestrian** (earliest-appearing `p_track_id`)
 - Concatenates and **sorts by frame index**
-- Computes 7 features per timestep:
+- Returns two separate feature arrays:
 
 ```
-features (T, 7) = [v_loc_x, v_loc_y, v_speed, p_loc_x, p_loc_y, p_speed, v_p_distance]
-                    ←── vehicle ──→              ←── pedestrian ──→        └─ Euclidean
+vehicle_feat (T, 3) = [v_loc_x_centered, v_loc_y_centered, v_speed]
+                       └──── origin = vehicle pos at t=0 ────┘
+
+ped_feat (T, 3)     = [p_loc_x_rel, p_loc_y_rel, p_speed]
+                       └──── relative to vehicle position ───┘
 ```
 
-### Trajectory Sampling (`_sample_trajectory`)
+Vehicle trajectory is **ego-centered** (origin at first position). Pedestrian location is expressed relative to the vehicle at each frame.
 
-Since sequences have variable lengths, they are resampled to a fixed `num_frames=32`:
+### Normalization (`_zscore_speed`)
+
+Applied per-sample in `__getitem__` after resampling. The speed column (index 2) of both `vehicle_feat` and `ped_feat` is z-score normalized independently:
+
+```python
+speed_normalized = (speed - mean) / (std + 1e-6)
+```
+
+### Trajectory Resampling (`_resample`)
+
+Sequences are resampled to a fixed `num_frames=32`:
 
 | Case | Strategy |
 |------|----------|
 | T == 32 | Use as-is |
-| T > 32 | Uniformly subsample with `np.linspace` |
-| T < 32 | Tile and repeat to fill 32 frames |
+| T > 32  | Uniformly subsample with `np.linspace` |
+| T < 32  | Tile and repeat to fill 32 frames |
 
 ### Dataset Item (`__getitem__`)
 ```python
 {
-    'trajectory': Tensor(32, 7),      # float32
-    'label':      Tensor(scalar),     # 0=violation, 1=compliance (long)
-    'video_id':   str,
-    'tracking_id': int,
-    'start_frame': int,
+    'vehicle_feat':   Tensor(32, 3),   # float32 — ego-centered vehicle trajectory
+    'ped_feat':       Tensor(32, 3),   # float32 — vehicle-relative ped trajectory
+    'has_pedestrian': Tensor(bool),    # False if trajectory data was missing
+    'label':          Tensor(scalar),  # 0=violation, 1=compliance (long)
+    'video_id':       str,
+    'tracking_id':    int,
+    'start_frame':    int,
 }
 ```
 
@@ -77,31 +92,44 @@ Since sequences have variable lengths, they are resampled to a fixed `num_frames
 
 ## 2. Model Architecture (`models/`)
 
-### `TrajectoryEncoder` (GRU)
+### `TrajectoryEncoder` (Bidirectional GRU)
 ```
-Input:  (B, T=32, 7)
+Input:  (B, T=32, 3)
           ↓
-GRU(input_size=7, hidden_size=128, num_layers=2, dropout=0.3)
+Linear(3 → 64) + ReLU          ← embedding projection
           ↓
-Take last layer hidden state: hidden[-1]
+BiGRU(input=64, hidden=64, num_layers=1, bidirectional=True)
           ↓
-Output: (B, 128)
+Output: (B, T, 128)             ← full sequence, 64×2 directions
 ```
 
-The GRU processes the trajectory as a **sequence**, capturing temporal dynamics. The final hidden state is a compact summary of the entire interaction.
+One encoder is used for the vehicle stream and a separate independent encoder for the pedestrian stream.
 
-### `TrajectoryOnlyModel` (full model)
+### `CrossAttentionModel` (full model)
 ```
-Input: trajectory (B, 32, 7)
-          ↓
-TrajectoryEncoder → (B, 128)
-          ↓
-Linear(128 → 64) → ReLU → Dropout(0.3)
-          ↓
-Linear(64 → 2)
-          ↓
-Output: logits (B, 2)   [class 0=violation, class 1=compliance]
+vehicle_feat (B, 32, 3)          ped_feat (B, 32, 3)
+       ↓                                ↓
+TrajectoryEncoder            TrajectoryEncoder
+       ↓                                ↓
+vehicle_enc (B, T, 128)      ped_enc (B, T, 128)
+               ↓
+MultiheadAttention(embed=128, heads=4)
+  query = vehicle_enc
+  key   = ped_enc
+  value = ped_enc
+               ↓
+attended (B, T, 128)
+               ↓
+max-pool over T → (B, 128)
+               ↓
+Linear(128→64) → ReLU → Dropout(0.3)
+               ↓
+Linear(64→2)
+               ↓
+logits (B, 2)   [class 0=violation, class 1=compliance]
 ```
+
+The cross-attention lets the vehicle encoder **query the pedestrian trajectory** to highlight the frames most relevant for classification.
 
 ---
 
@@ -109,44 +137,53 @@ Output: logits (B, 2)   [class 0=violation, class 1=compliance]
 
 ### Setup
 ```
-Load full dataset
+Load full dataset from train_labels.pkl
     ↓
-Compute class weights (inverse frequency) → weighted CrossEntropyLoss
+Scene-stratified 85/15 train/val split by video
     ↓
-80/20 train/val split (random, seed=42)
+Fixed class weights: violation=3.5, compliance=1.0
     ↓
 Train with Adam optimizer + Mixed Precision (AMP) + Gradient Accumulation (×4)
 ```
 
-### Class Weights
-Because violations and compliance may be imbalanced:
-```python
-weight[class] = 1.0 / count[class]
-weights are then normalized to sum to 1
+### Scene-Stratified Split
+
+All events from the same video are kept in the same partition. Videos are sorted, and the last 15% become the validation set. This prevents data leakage across splits.
+
 ```
-This prevents the model from ignoring the minority class.
+Example (10 videos sorted): videos 1–8 → train, videos 9–10 → val
+```
+
+### Class Weights
+
+Fixed weights (`violation=3.5, compliance=1.0`) passed to `CrossEntropyLoss` to counteract class imbalance.
 
 ### Gradient Accumulation
-Effective batch size = `batch_size × accumulation_steps` = `2 × 4 = 8`.
-This simulates a larger batch without extra GPU memory.
+
+Effective batch size = `batch_size × accumulation_steps` = `2 × 4 = 8`. Simulates a larger batch without extra GPU memory.
 
 ### Per-Epoch Flow
 ```
 train_epoch():
     for each batch:
-        forward pass (AMP autocast)
-        loss = CrossEntropy / accumulation_steps
+        forward pass: model(vehicle_feat, ped_feat) → logits
+        loss = CrossEntropy(logits, labels) / accumulation_steps
         backward()
         every 4 steps: optimizer.step(), zero_grad()
 
 validate():
     no_grad + AMP
     compute loss + accuracy
+
+compute_val_ap():
+    run full AP evaluation on val video IDs → APv, APn, mAP
 ```
 
 ### Checkpointing
-- Best model (by validation accuracy) saved to `checkpoints/best_model.pth`
-- Overfit mode saves to `checkpoints/overfit_model.pth` instead
+- Primary criterion: best **APv** (AP for violation class)
+- Fallback if no parquet files available for val videos: best **val accuracy**
+- Saved to `checkpoints/best_model.pth`
+- Overfit mode saves to `checkpoints/overfit_model.pth`
 
 ### Overfit Mode (`--overfit`)
 A sanity check: train == val on a single video. If the model cannot reach ~100% accuracy here, there is a bug in the data pipeline or model.
@@ -175,12 +212,14 @@ Both predictions and GT are dicts:
     "video_id":    str,        # e.g. "video_001"
     "v_track_id":  int,
     "roi":         str,        # "TOP" or "BOT"
-    "label":       int,        # 1=violation, 0=non-violation
+    "gt_label":    int,        # 1=violation, 0=non-violation
     "frame_start": int,
     "frame_end":   int,
     "pos_start":   [x, y],     # vehicle world position (metres)
     "pos_end":     [x, y],
-    "score":       float,      # confidence (0–1)
+    "score":       float,      # P(violation) from model softmax
+    "score_n":     float,      # P(non-violation) = 1 - score
+    "eiou":        float,      # World-EIoU with matched GT event
 }
 ```
 
@@ -198,7 +237,7 @@ World-EIoU = tIoU × (SPIoU_start + SPIoU_end) / 2
 ```
 tIoU = overlap_frames / union_frames
 ```
-Standard intersection-over-union on frame ranges.
+Standard intersection-over-union on frame ranges (inclusive).
 
 **Spatial Proximity IoU (SPIoU):**
 ```
@@ -208,42 +247,45 @@ Where `distance` is Euclidean distance in metres between vehicle positions, and 
 
 SPIoU is computed at both the **start** and **end** positions, then averaged.
 
-**Result:** 0 if different video/ROI, or no temporal overlap; otherwise a score in `[0, 1]`.
+**Result:** 0 immediately if different `video_id`, different `roi`, or `tIoU == 0`; otherwise a score in `[0, 1]`.
 
 ---
 
 ### AP Calculation (`ap_calculator.py`)
 
-**Step 1 — Match predictions to GT (greedy):**
-```
-For each GT event:
-    Find the unmatched prediction with highest EIoU > 0
-    Assign GT label to that prediction
-All remaining predictions → matched_label = 0 (non-violation)
+**Two APs are computed:**
+- **APv** — ranks predictions by `score` (P(violation)); TP if `gt_label == 1`
+- **APn** — ranks predictions by `score_n` (P(non-violation)); TP if `gt_label == 0`
+- **mAP** = (APv + APn) / 2
+
+**Localization penalty (`compute_map`):**
+Before computing AP, predictions where `predicted_class == gt_label` but `eiou ≤ 0.5` have both scores zeroed — correct class but poor localization is penalized.
+
+```python
+predicted_class = 1 if score >= 0.5 else 0
+if predicted_class == gt_label and eiou <= threshold:
+    score = 0.0;  score_n = 0.0
 ```
 
-**Step 2 — Apply EIoU threshold:**
-```
-If 0 < eiou ≤ 0.5 (weak match):
-    matched_label = -1  → FP for both classes
-If eiou == 0.0 (no match):
-    matched_label = 0   → counts as non-violation TP
-If eiou > 0.5 (good match):
-    keep assigned GT label
-```
+**Per-class AP (`compute_ap`):**
+- Sort predictions by the class-specific score key descending
+- Walk the sorted list, accumulate TP/FP at each position
+- Build precision-recall curve (prepended with P=1, R=0)
+- Area under curve via **trapezoidal rule** (`np.trapz`)
 
-**Step 3 — Compute AP per class:**
-- Sort predictions by `score` descending
-- Walk the sorted list, accumulate TP/FP
-- Build precision-recall curve
-- Area under curve via **trapezoidal rule**
+---
 
-**Step 4 — mAP:**
-```
-APv = AP for class 1 (violation)
-APn = AP for class 0 (non-violation)
-mAP = (APv + APn) / 2
-```
+### Key Numbers
+
+| Parameter | Value |
+|-----------|-------|
+| `d_max` for SPIoU | 5.0 m |
+| EIoU threshold (TP cutoff) | 0.5 |
+| Trajectory length | 32 frames |
+| Vehicle/ped feature dims | 3 each |
+| GRU encoder output dim | 128 (bidirectional) |
+| Cross-attention heads | 4 |
+| Baseline expected mAP | ~0.5 |
 
 ---
 
@@ -262,8 +304,9 @@ Also reported per ROI (TOP / BOT).
 
 ---
 
-### Evaluation Entry Point (`run_evaluation.py`)
+### Evaluation Modes
 
+**Baseline (`run_evaluation.py`)** — no model, `score=1.0`, `eiou=1.0` for all labeled events:
 ```
 python -m evaluation.run_evaluation \
     --parquet-dir data/processed/interactions \
@@ -273,16 +316,38 @@ python -m evaluation.run_evaluation \
 
 Flow:
 ```
-build_detected_events()   ← from parquet (score=1.0, no model yet)
+build_detected_events()       ← from parquet (score=1.0, no model)
     ↓
-build_gt_events()         ← from labels pkl, proxies positions from detected
+build_gt_events()             ← from labels pkl, proxies positions from detected
     ↓
-compute_localization_rate()   → prints localization report
+compute_localization_rate()   → localization report
     ↓
-compute_map()                 → prints APv, APn, mAP
+build_baseline_events()       ← labeled events only, score=1.0, eiou=1.0
+compute_map()                 → APv, APn, mAP
 ```
 
-> **Baseline expectation:** With `score=1.0` for all detections and no real model, `mAP ≈ 0.5` (random).
+> **Baseline expectation:** `mAP ≈ 0.5` — all predictions get the same score so ranking is random.
+
+**Model evaluation (`evaluate_model.py`)** — loads a checkpoint and scores each event:
+```
+python evaluation/evaluate_model.py \
+    --checkpoint checkpoints/best_model.pth \
+    --video-ids  2 4 6 8 10
+```
+
+Flow:
+```
+Load checkpoint → CrossAttentionModel
+    ↓
+For each labeled event in parquet:
+    Build vehicle_feat (32, 3) and ped_feat (32, 3)
+    Run model(vehicle_feat, ped_feat) → softmax → score = probs[:, 0]  (logit 0 = violation)
+    Set eiou = 1.0  (GT proxied from same detection → always matches)
+    ↓
+compute_map(predictions)  → APv, APn, mAP
+```
+
+Since `eiou = 1.0` for all events, the localization penalty never fires — mAP is a **pure classification quality** measure.
 
 ---
 
@@ -291,19 +356,23 @@ compute_map()                 → prints APv, APn, mAP
 ```
 Raw label PKL  ──┐
                  ├──► load_violation_dataset() ──► ViolationDataset
-Parquet files  ──┘         (trajectories)               │
+Parquet files  ──┘     (vehicle_feat, ped_feat)         │
+                                                         │
+                                              Scene-stratified 85/15 split
+                                              (by video, no leakage)
                                                          │
                                                    DataLoader
                                                          │
-                                              TrajectoryOnlyModel
-                                              (GRU → classifier)
+                                              CrossAttentionModel
+                                              (BiGRU × 2 + cross-attn)
                                                          │
                                               CrossEntropyLoss
-                                              (class-weighted)
+                                              (fixed weights 3.5/1.0)
                                                          │
-                                              Adam + AMP + accumulation
+                                              Adam + AMP + accumulation×4
                                                          │
                                               checkpoints/best_model.pth
+                                              (saved by best APv)
 
 ─────────────── Separately ─────────────────────────────
 

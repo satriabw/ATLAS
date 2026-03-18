@@ -1,194 +1,144 @@
-"""APv, APn, mAP computation using World-EIoU matching.
+"""APv, APn, mAP computation aligned with the original Crosswalk ap_cal.py.
 
-Matching is greedy (same logic as Crosswalk ap_cal.py):
-  for each GT event → find the unmatched prediction with highest EIoU > 0
-  assign GT label to that prediction; all remaining predictions → label 0.
+Each prediction must carry:
+    gt_label  : int   — 1 (violation) or 0 (non-violation)
+    score     : float — P(violation)  from model softmax
+    score_n   : float — P(non-violation) = 1 - score
+    eiou      : float — World-EIoU with the corresponding GT event
 
-AP is computed manually via precision-recall curve (no sklearn).
+AP is computed per class with the class-specific confidence score:
+    APv  →  sorted by score   (P(violation))
+    APn  →  sorted by score_n (P(non-violation))
+
+If eiou <= eiou_threshold AND the predicted class matches gt_label,
+both scores are zeroed (correct class, poor localization — same as
+the original ap_cal.py zeroing logic).
+
+AP is computed as a step-function sum (Σ ΔR × P), matching sklearn's
+average_precision_score and the original ap_cal.py behaviour.
 """
 
 from __future__ import annotations
 
 import numpy as np
-from .world_eiou import calculate_world_eiou
 
 
-def match_predictions_to_gt(
+def compute_ap(
     predictions: list[dict],
-    ground_truth: list[dict],
-    d_max: float = 5.0,
-) -> list[dict]:
-    """Match predictions to GT events and annotate each prediction.
-
-    Adds two fields to every prediction dict (copies are returned):
-        matched_label : int   — GT label if matched, else 0 (non-violation)
-        eiou          : float — best World-EIoU found (0.0 if unmatched)
-
-    Args:
-        predictions:  list of predicted event dicts (must have 'score' field).
-        ground_truth: list of GT event dicts (must have 'label' field).
-        d_max:        spatial proximity threshold in metres.
-
-    Returns:
-        List of annotated prediction dicts (same order as input).
-    """
-    # Work on shallow copies so callers' dicts are not mutated.
-    annotated = [dict(p) for p in predictions]
-    for p in annotated:
-        p["matched_label"] = 0
-        p["eiou"] = 0.0
-
-    matched_pred_indices: set[int] = set()
-
-    for gt in ground_truth:
-        best_eiou = 0.0
-        best_idx  = -1
-
-        for i, pred in enumerate(annotated):
-            if i in matched_pred_indices:
-                continue
-            eiou = calculate_world_eiou(pred, gt, d_max=d_max)
-            if eiou > best_eiou:
-                best_eiou = eiou
-                best_idx  = i
-
-        if best_idx >= 0 and best_eiou > 0.0:
-            annotated[best_idx]["matched_label"] = gt["label"]
-            annotated[best_idx]["eiou"]          = best_eiou
-            matched_pred_indices.add(best_idx)
-
-    return annotated
-
-
-def compute_ap(matched_predictions: list[dict], target_class: int, n_gt: int | None = None) -> float:
+    target_class: int,
+    n_gt: int | None = None,
+    score_key: str = "score",
+) -> float:
     """Compute AP for one class using a precision-recall curve.
 
-    A prediction is a TP if:
-        matched_label == target_class  AND  eiou > 0  (already encoded by matching)
-
-    Predictions are sorted by 'score' descending.
+    A prediction is a TP if gt_label == target_class.
+    Predictions are sorted by score_key descending.
 
     Args:
-        matched_predictions: annotated prediction dicts.
-        target_class:        class index to compute AP for.
-        n_gt:                total number of GT events for this class.  If
-                             provided it is used as the recall denominator so
-                             that unmatched GT events are counted as FNs.
-                             Defaults to the number of matched TPs.
+        predictions:  list of event dicts with gt_label and score fields.
+        target_class: class index to compute AP for (1=violation, 0=non-viol).
+        n_gt:         total GT count for this class (recall denominator).
+                      Defaults to TP count found in predictions.
+        score_key:    dict key for the ranking score.
 
     Returns AP in [0, 1].
     """
-    if not matched_predictions:
+    if not predictions:
         return 0.0
 
-    # Sort by score descending
-    sorted_preds = sorted(matched_predictions, key=lambda p: p["score"], reverse=True)
+    sorted_preds = sorted(predictions, key=lambda p: p[score_key], reverse=True)
 
-    n_pos = n_gt if n_gt is not None else sum(1 for p in sorted_preds if p["matched_label"] == target_class)
+    n_pos = n_gt if n_gt is not None else sum(
+        1 for p in sorted_preds if p["gt_label"] == target_class
+    )
     if n_pos == 0:
         return 0.0
 
     tp_cumsum = 0
     fp_cumsum = 0
-    precisions = []
-    recalls    = []
+    precisions: list[float] = []
+    recalls:    list[float] = []
 
     for pred in sorted_preds:
-        if pred["matched_label"] == target_class:
+        if pred["gt_label"] == target_class:
             tp_cumsum += 1
         else:
             fp_cumsum += 1
         precisions.append(tp_cumsum / (tp_cumsum + fp_cumsum))
         recalls.append(tp_cumsum / n_pos)
 
-    # Area under PR curve via trapezoidal rule (matches sklearn's method)
-    precisions = np.array(precisions, dtype=np.float64)
-    recalls    = np.array(recalls,    dtype=np.float64)
+    precisions_arr = np.array(precisions)
+    recalls_arr    = np.concatenate([[0.0], recalls])
 
-    # Prepend (0, 1) sentinel so the curve starts correctly
-    precisions = np.concatenate([[1.0], precisions])
-    recalls    = np.concatenate([[0.0], recalls])
-
-    ap = float(np.trapz(precisions, recalls))
+    ap = float(np.sum(np.diff(recalls_arr) * precisions_arr))
     return max(0.0, min(1.0, ap))
 
 
 def compute_pr_curve(
-    matched_predictions: list[dict],
+    predictions: list[dict],
     target_class: int,
     n_gt: int | None = None,
+    score_key: str = "score",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (recalls, precisions) arrays for one class, sorted by recall.
+    """Return (recalls, precisions) arrays for one class.
 
-    Useful for plotting the PR curve.  Uses the same logic as compute_ap.
-
-    Args:
-        n_gt: total GT count for this class (used as recall denominator).
-              Defaults to matched TP count if not provided.
+    Useful for plotting PR curves. Uses the same logic as compute_ap.
     """
-    if not matched_predictions:
+    if not predictions:
         return np.array([0.0, 1.0]), np.array([1.0, 1.0])
 
-    sorted_preds = sorted(matched_predictions, key=lambda p: p["score"], reverse=True)
-    n_pos = n_gt if n_gt is not None else sum(1 for p in sorted_preds if p["matched_label"] == target_class)
+    sorted_preds = sorted(predictions, key=lambda p: p[score_key], reverse=True)
+    n_pos = n_gt if n_gt is not None else sum(
+        1 for p in sorted_preds if p["gt_label"] == target_class
+    )
     if n_pos == 0:
         return np.array([0.0, 1.0]), np.array([1.0, 1.0])
 
     tp_cumsum = 0
     fp_cumsum = 0
-    precisions = []
-    recalls    = []
+    precisions: list[float] = []
+    recalls:    list[float] = []
 
     for pred in sorted_preds:
-        if pred["matched_label"] == target_class:
+        if pred["gt_label"] == target_class:
             tp_cumsum += 1
         else:
             fp_cumsum += 1
         precisions.append(tp_cumsum / (tp_cumsum + fp_cumsum))
         recalls.append(tp_cumsum / n_pos)
 
-    precisions = np.concatenate([[1.0], precisions])
-    recalls    = np.concatenate([[0.0], recalls])
-    return recalls, precisions
+    precisions_arr = np.concatenate([[1.0], precisions])
+    recalls_arr    = np.concatenate([[0.0], recalls])
+    return recalls_arr, precisions_arr
 
 
 def compute_map(
     predictions: list[dict],
-    ground_truth: list[dict],
-    d_max: float = 5.0,
     eiou_threshold: float = 0.5,
 ) -> dict:
     """Compute APv, APn, and mAP.
 
-    A prediction is TP only if eiou > eiou_threshold AND label matches.
+    Aligned with the original ap_cal.py:
+      - APv uses score   = P(violation)
+      - APn uses score_n = P(non-violation) = 1 - score
+      - If eiou <= eiou_threshold AND predicted class == gt_label:
+        zero both scores (correct class but poor localization → penalized).
 
-    Args:
-        predictions:    predicted event dicts (each must have 'score' field).
-        ground_truth:   GT event dicts (each must have 'label' field).
-        d_max:          spatial proximity threshold (metres).
-        eiou_threshold: minimum EIoU to count as a true positive.
+    Each prediction must have: gt_label, score, score_n, eiou.
 
-    Returns:
-        {"APv": float, "APn": float, "mAP": float}
+    Returns {"APv": float, "APn": float, "mAP": float}.
     """
-    matched = match_predictions_to_gt(predictions, ground_truth, d_max=d_max)
-
-    # Apply eiou_threshold only to *matched* predictions (eiou > 0) whose
-    # match quality is too low.  Truly unmatched predictions (eiou == 0.0)
-    # keep matched_label=0 (non-violation) so they count as TP for APn.
     thresholded = []
-    for p in matched:
+    for p in predictions:
         p2 = dict(p)
-        if 0.0 < p2["eiou"] <= eiou_threshold:
-            p2["matched_label"] = -1   # weak match → FP for both classes
+        predicted_class = 1 if p2["score"] >= 0.5 else 0
+        if predicted_class == p2["gt_label"] and p2["eiou"] <= eiou_threshold:
+            p2["score"]   = 0.0
+            p2["score_n"] = 0.0
         thresholded.append(p2)
 
-    # Use total GT counts so unmatched GT events count as FNs in recall.
-    n_gt_v = sum(1 for g in ground_truth if g["label"] == 1)
-    n_gt_n = sum(1 for g in ground_truth if g["label"] == 0)
-
-    apv = compute_ap(thresholded, target_class=1, n_gt=n_gt_v)   # violation = 1
-    apn = compute_ap(thresholded, target_class=0, n_gt=n_gt_n)   # non-violation = 0
+    apv = compute_ap(thresholded, target_class=1, score_key="score")
+    apn = compute_ap(thresholded, target_class=0, score_key="score_n")
     map_ = (apv + apn) / 2.0
 
     return {"APv": apv, "APn": apn, "mAP": map_}

@@ -16,9 +16,26 @@ class CrossAttentionModel(nn.Module):
             nn.Linear(64, num_classes),
         )
 
-    def forward(self, vehicle_feat: torch.Tensor, ped_feat: torch.Tensor) -> torch.Tensor:
-        vehicle_enc = self.vehicle_encoder(vehicle_feat)  # (B, T, 128)
-        ped_enc = self.ped_encoder(ped_feat)              # (B, T, 128)
-        attended, _ = self.cross_attn(query=vehicle_enc, key=ped_enc, value=ped_enc)
-        pooled = attended.max(dim=1).values               # (B, 128)
+    def forward(
+        self,
+        vehicle_feat: torch.Tensor,
+        ped_feat: torch.Tensor,
+        v_padding_mask: torch.Tensor = None,  # (B, T_v)  True = padded
+        p_padding_mask: torch.Tensor = None,  # (B, T_p)  True = padded
+    ) -> torch.Tensor:
+        vehicle_enc = self.vehicle_encoder(vehicle_feat)  # (B, T_v, 128)
+        ped_enc     = self.ped_encoder(ped_feat)          # (B, T_p, 128)
+
+        # Cross-attention: vehicle queries pedestrian sequence.
+        # key_padding_mask marks padded ped positions so attention ignores them.
+        attended, _ = self.cross_attn(
+            query=vehicle_enc, key=ped_enc, value=ped_enc,
+            key_padding_mask=p_padding_mask,
+        )
+
+        # Mask padded vehicle positions before max-pool so they don't win.
+        if v_padding_mask is not None:
+            attended = attended.masked_fill(v_padding_mask.unsqueeze(-1), float('-inf'))
+
+        pooled = attended.max(dim=1).values  # (B, 128)
         return self.classifier(pooled)

@@ -72,6 +72,85 @@ def _to_frames(val) -> np.ndarray:
     return np.asarray(val, dtype=np.int64).ravel()
 
 
+def build_baseline_events(
+    parquet_dir: Path,
+    labels_pkl: Path,
+    video_ids: list[str],
+) -> list[dict]:
+    """Build events for GT-labeled interactions with score=1.0 (no model).
+
+    Aligned with the original ap_cal.py: only labeled events are evaluated.
+    Each event carries gt_label, score=1.0, score_n=0.0, eiou=1.0.
+    """
+    with open(labels_pkl, "rb") as f:
+        label_strings, _ = pickle.load(f)
+
+    video_set = set(video_ids)
+    label_index: dict[tuple, int] = {}
+    for s in label_strings:
+        try:
+            vid, tid, roi, lbl = parse_label_string(s)
+        except ValueError as e:
+            logger.warning(e)
+            continue
+        if vid in video_set:
+            label_index[(vid, tid, roi)] = lbl
+
+    events: list[dict] = []
+
+    for vid in video_ids:
+        parquet_path = parquet_dir / f"{vid}_interactions.parquet"
+        if not parquet_path.exists():
+            logger.warning(f"Parquet not found: {parquet_path}")
+            continue
+
+        df = pd.read_parquet(parquet_path)
+
+        for (v_track_id, roi), group in df.groupby(["v_track_id", "roi"]):
+            key = (vid, int(v_track_id), str(roi))
+            if key not in label_index:
+                continue
+
+            gt_label = label_index[key]
+
+            try:
+                all_frames: list[np.ndarray] = []
+                all_vloc:   list[np.ndarray] = []
+                for _, row in group.iterrows():
+                    f = _to_frames(row["frames"])
+                    v = _to_loc(row["v_loc_planar"])
+                    if len(f) != len(v):
+                        min_len = min(len(f), len(v))
+                        f, v = f[:min_len], v[:min_len]
+                    all_frames.append(f)
+                    all_vloc.append(v)
+
+                frames_cat = np.concatenate(all_frames)
+                vloc_cat   = np.vstack(all_vloc)
+                order       = np.argsort(frames_cat, kind="stable")
+                frames_cat  = frames_cat[order]
+                vloc_cat    = vloc_cat[order]
+
+                events.append({
+                    "video_id":    vid,
+                    "v_track_id":  int(v_track_id),
+                    "roi":         str(roi),
+                    "gt_label":    gt_label,
+                    "frame_start": int(frames_cat[0]),
+                    "frame_end":   int(frames_cat[-1]),
+                    "pos_start":   vloc_cat[0].tolist(),
+                    "pos_end":     vloc_cat[-1].tolist(),
+                    "score":       1.0,
+                    "score_n":     0.0,
+                    "eiou":        1.0,
+                })
+            except Exception as exc:
+                logger.warning(f"Skipping group ({vid}, {v_track_id}, {roi}): {exc}")
+
+    logger.info(f"Built {len(events)} baseline events from {len(video_ids)} video(s)")
+    return events
+
+
 def build_detected_events(parquet_dir: Path, video_ids: list[str]) -> list[dict]:
     """Build a detected-event list from parquet files.
 
@@ -227,7 +306,7 @@ def main() -> None:
     detected = build_detected_events(args.parquet_dir, video_ids)
     gt       = build_gt_events(args.labels_pkl, video_ids, detected)
 
-    # ---- Localization report ----
+    # ---- Localization report (all parquet events vs all GT labels) ----
     loc = compute_localization_rate(
         detected, gt,
         d_max=args.d_max,
@@ -242,17 +321,14 @@ def main() -> None:
         rate = loc["per_roi"].get(roi, 0.0)
         print(f"{roi:<8}        : {rate:.1%}")
 
-    # ---- AP report (score=1.0 baseline) ----
-    ap_result = compute_map(
-        detected, gt,
-        d_max=args.d_max,
-        eiou_threshold=args.eiou_threshold,
-    )
+    # ---- AP report (score=1.0 baseline, labeled events only) ----
+    baseline = build_baseline_events(args.parquet_dir, args.labels_pkl, video_ids)
+    ap_result = compute_map(baseline, eiou_threshold=args.eiou_threshold)
 
     print()
     print("=== AP Report (score=1.0 baseline) ===")
-    print(f"APv  : {ap_result['APv']:.3f}  (no model yet — expected)")
-    print(f"APn  : {ap_result['APn']:.3f}  (all unmatched → non-violation)")
+    print(f"APv  : {ap_result['APv']:.3f}")
+    print(f"APn  : {ap_result['APn']:.3f}")
     print(f"mAP  : {ap_result['mAP']:.3f}")
 
 
