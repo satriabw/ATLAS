@@ -4,10 +4,10 @@ import numpy as np
 import pandas as pd
 import pickle
 import torch
+from dataclasses import dataclass
 from torch.utils.data import Dataset
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
-from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -26,14 +26,6 @@ class ViolationLabel:
     start_frame: int
     end_frame: int
     annotation: int   # 0=violation, 1=compliance
-
-
-@dataclass
-class SpeedStats:
-    v_speed_mean: float
-    v_speed_std: float   # includes 1e-6 guard
-    p_speed_mean: float
-    p_speed_std: float   # includes 1e-6 guard
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +60,6 @@ def _to_frames(val) -> np.ndarray:
     return np.asarray(val, dtype=np.int64).ravel()
 
 def _to_dmin(val) -> float:
-    """Return minimum d_min, handling both scalar and array-typed columns."""
     return float(np.asarray(val, dtype=np.float64).ravel().min())
 
 
@@ -79,10 +70,6 @@ def _to_dmin(val) -> float:
 def _extract_row_arrays(
     rows_df: pd.DataFrame,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Concatenate and sort by frame all arrays from a set of rows.
-
-    Returns (frames, v_loc, v_sp, p_loc, p_sp) each sorted by frame index.
-    """
     frames_parts, v_loc_parts, v_sp_parts, p_loc_parts, p_sp_parts = [], [], [], [], []
     for _, row in rows_df.iterrows():
         frames_parts.append(_to_frames(row['frames']))
@@ -109,15 +96,12 @@ def _build_group_trajectory(
 ) -> Tuple[int, int, np.ndarray, List[np.ndarray]]:
     """Build vehicle and top-K pedestrian trajectories for one (v_track_id, roi) group.
 
-    Pedestrians are ranked by mean d_min (closest first). If fewer than top_k exist,
-    the returned list is shorter.
-
     Returns:
         start_frame  : int
         end_frame    : int
         vehicle_feat : (T, 3)  [v_loc_x_centered, v_loc_y_centered, v_speed]
         ped_feats    : List of up to top_k arrays each (T_k, 3)
-                       [p_loc_x_rel, p_loc_y_rel, p_speed]  (relative to vehicle)
+                       [p_loc_x_rel, p_loc_y_rel, p_speed]
     """
     group_df = group_df.copy()
     group_df['_first_frame'] = group_df['frames'].apply(lambda f: int(_to_frames(f)[0]))
@@ -140,8 +124,7 @@ def _build_group_trajectory(
     # Vehicle trajectory from the closest pedestrian's rows
     primary_rows = group_df[group_df['p_track_id'] == top_ped_ids[0]]
     _, v_loc, v_sp, _, _ = _extract_row_arrays(primary_rows)
-    v_origin  = v_loc[0:1]
-    v_centered = v_loc - v_origin
+    v_centered   = v_loc - v_loc[0:1]
     vehicle_feat = np.concatenate([v_centered, v_sp], axis=1).astype(np.float32)
 
     # Pedestrian trajectories for each selected ped
@@ -156,15 +139,11 @@ def _build_group_trajectory(
 
 
 # ---------------------------------------------------------------------------
-# Resampling / padding  (module-level so evaluate_model.py can import it)
+# Resampling / padding
 # ---------------------------------------------------------------------------
 
 def _resample_trajectory(features: np.ndarray, num_frames: int) -> Tuple[np.ndarray, int]:
-    """Resample or zero-pad a trajectory to num_frames.
-
-    Returns (resampled_features, actual_len).
-    actual_len < num_frames means the tail is zero-padded; pass to model as mask.
-    """
+    """Resample or zero-pad a trajectory to num_frames. Returns (features, actual_len)."""
     T = features.shape[0]
     if T == num_frames:
         return features, T
@@ -181,10 +160,7 @@ def _resample_trajectory(features: np.ndarray, num_frames: int) -> Tuple[np.ndar
 # Dataset loading helpers
 # ---------------------------------------------------------------------------
 
-def _parse_labels(
-    pkl_path: Path,
-    allowed: Optional[set],
-) -> List[Tuple[str, int, str, int]]:
+def _parse_labels(pkl_path: Path, allowed: Optional[set]) -> List[Tuple[str, int, str, int]]:
     with open(pkl_path, 'rb') as f:
         label_strings, _ = pickle.load(f)
     logger.info(f"Loaded {len(label_strings)} raw label strings from {pkl_path.name}")
@@ -210,12 +186,6 @@ def _load_parquet_trajectories(
     parquet_dir: Path,
     top_k: int,
 ) -> Tuple[Dict, Dict]:
-    """Load parquet files and build trajectory cache.
-
-    Returns:
-        traj_data    : {(video_id, track_id, roi): (vehicle_feat, ped_feats_list)}
-        frame_ranges : {(video_id, track_id, roi): (start_frame, end_frame)}
-    """
     traj_data: Dict[Tuple, Tuple] = {}
     frame_ranges: Dict[Tuple, Tuple] = {}
 
@@ -238,10 +208,7 @@ def _load_parquet_trajectories(
     return traj_data, frame_ranges
 
 
-def _assemble_labels(
-    parsed: List[Tuple],
-    frame_ranges: Dict,
-) -> List[ViolationLabel]:
+def _assemble_labels(parsed: List[Tuple], frame_ranges: Dict) -> List[ViolationLabel]:
     labels, skipped = [], 0
     for vid, tid, roi, ann in parsed:
         key = (vid, tid, roi)
@@ -269,46 +236,12 @@ class ViolationDataset(Dataset):
         traj_data: Dict[Tuple, Tuple],
         num_frames: int = 32,
         top_k: int = DEFAULT_TOP_K,
-        speed_stats: Optional[SpeedStats] = None,
     ):
-        self.labels      = labels
-        self.traj_data   = traj_data
-        self.num_frames  = num_frames
-        self.top_k       = top_k
-        self.speed_stats = speed_stats
+        self.labels     = labels
+        self.traj_data  = traj_data
+        self.num_frames = num_frames
+        self.top_k      = top_k
         logger.info(f"Initialized dataset with {len(labels)} samples (top_k={top_k})")
-
-    def compute_and_set_speed_stats(self, video_ids: Optional[set] = None) -> SpeedStats:
-        """Compute global speed mean/std from traj_data, optionally restricted to video_ids.
-
-        Call with the training video set after the scene split to avoid val leakage.
-        """
-        v_speeds, p_speeds = [], []
-        for (vid, _, _), (v_feat, ped_feats) in self.traj_data.items():
-            if video_ids is None or vid in video_ids:
-                v_speeds.append(v_feat[:, 2])
-                for pf in ped_feats:
-                    p_speeds.append(pf[:, 2])
-
-        if not v_speeds:
-            logger.warning("No trajectories found for speed stats; using unit stats")
-            self.speed_stats = SpeedStats(0.0, 1.0, 0.0, 1.0)
-        else:
-            all_v = np.concatenate(v_speeds)
-            all_p = np.concatenate(p_speeds)
-            self.speed_stats = SpeedStats(
-                v_speed_mean=float(all_v.mean()),
-                v_speed_std =float(all_v.std() + 1e-6),
-                p_speed_mean=float(all_p.mean()),
-                p_speed_std =float(all_p.std() + 1e-6),
-            )
-
-        s = self.speed_stats
-        logger.info(
-            f"Speed stats — v: mean={s.v_speed_mean:.3f} std={s.v_speed_std:.3f} | "
-            f"p: mean={s.p_speed_mean:.3f} std={s.p_speed_std:.3f}"
-        )
-        return self.speed_stats
 
     def __len__(self):
         return len(self.labels)
@@ -319,15 +252,15 @@ class ViolationDataset(Dataset):
             label.video_id, label.tracking_id, label.roi
         )
         return {
-            'vehicle_feat':    v_feat,
-            'ped_feat':        p_feat,
-            'v_padding_mask':  v_mask,
-            'p_padding_mask':  p_mask,
-            'has_pedestrian':  torch.tensor(has_ped, dtype=torch.bool),
-            'label':           torch.tensor(label.annotation, dtype=torch.long),
-            'video_id':        label.video_id,
-            'tracking_id':     label.tracking_id,
-            'start_frame':     label.start_frame,
+            'vehicle_feat':   v_feat,
+            'ped_feat':       p_feat,
+            'v_padding_mask': v_mask,
+            'p_padding_mask': p_mask,
+            'has_pedestrian': torch.tensor(has_ped, dtype=torch.bool),
+            'label':          torch.tensor(label.annotation, dtype=torch.long),
+            'video_id':       label.video_id,
+            'tracking_id':    label.tracking_id,
+            'start_frame':    label.start_frame,
         }
 
     def _get_modalities(
@@ -348,23 +281,21 @@ class ViolationDataset(Dataset):
 
         # Vehicle
         v_arr, v_len = _resample_trajectory(vehicle_feat_raw, self.num_frames)
-        v_arr = self._apply_speed_stats(v_arr, is_vehicle=True)
-        v_mask = self._padding_mask(v_len, self.num_frames)
+        v_mask = _padding_mask(v_len, self.num_frames)
 
-        # Top-K pedestrians: resample, normalize, stack; zero-fill if fewer than top_k
+        # Top-K pedestrians: resample and stack; zero-fill if fewer than top_k
         p_arrs, p_masks = [], []
         for pf in ped_feats_raw[:self.top_k]:
             pf_arr, p_len = _resample_trajectory(pf, self.num_frames)
-            pf_arr = self._apply_speed_stats(pf_arr, is_vehicle=False)
             p_arrs.append(pf_arr)
-            p_masks.append(self._padding_mask(p_len, self.num_frames))
+            p_masks.append(_padding_mask(p_len, self.num_frames))
 
-        while len(p_arrs) < self.top_k:  # pad missing pedestrians
+        while len(p_arrs) < self.top_k:
             p_arrs.append(np.zeros((self.num_frames, 3), dtype=np.float32))
             p_masks.append(np.ones(self.num_frames, dtype=bool))
 
-        p_feat = np.concatenate(p_arrs,  axis=0)   # (top_k * num_frames, 3)
-        p_mask = np.concatenate(p_masks, axis=0)   # (top_k * num_frames,)
+        p_feat = np.concatenate(p_arrs,  axis=0)
+        p_mask = np.concatenate(p_masks, axis=0)
 
         return (
             torch.from_numpy(v_arr),
@@ -374,25 +305,12 @@ class ViolationDataset(Dataset):
             torch.from_numpy(p_mask),
         )
 
-    def _apply_speed_stats(self, features: np.ndarray, is_vehicle: bool) -> np.ndarray:
-        """Normalize speed column (index 2) using global stats."""
-        features = features.copy()
-        if self.speed_stats is not None:
-            mean = self.speed_stats.v_speed_mean if is_vehicle else self.speed_stats.p_speed_mean
-            std  = self.speed_stats.v_speed_std  if is_vehicle else self.speed_stats.p_speed_std
-        else:
-            logger.warning("speed_stats not set; falling back to per-sample normalization")
-            mean = float(features[:, 2].mean())
-            std  = float(features[:, 2].std()) + 1e-6
-        features[:, 2] = (features[:, 2] - mean) / std
-        return features
 
-    @staticmethod
-    def _padding_mask(valid_len: int, total_len: int) -> np.ndarray:
-        """Bool mask of shape (total_len,) where True = padded (should be ignored)."""
-        mask = np.zeros(total_len, dtype=bool)
-        mask[valid_len:] = True
-        return mask
+def _padding_mask(valid_len: int, total_len: int) -> np.ndarray:
+    """Bool mask of shape (total_len,) where True = padded (should be ignored)."""
+    mask = np.zeros(total_len, dtype=bool)
+    mask[valid_len:] = True
+    return mask
 
 
 # ---------------------------------------------------------------------------

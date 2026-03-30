@@ -29,7 +29,6 @@ from dataset.violation_dataset import (
     _resample_trajectory,
     _to_frames,
     _to_loc,
-    SpeedStats,
     DEFAULT_TOP_K,
 )
 from models import CrossAttentionModel
@@ -59,22 +58,15 @@ def _parse_label_string(s: str):
 
 
 # ---------------------------------------------------------------------------
-# Normalization helpers
+# Pedestrian stack helper
 # ---------------------------------------------------------------------------
-
-def _apply_speed_stats(features: np.ndarray, mean: float, std: float) -> np.ndarray:
-    features = features.copy()
-    features[:, 2] = (features[:, 2] - mean) / std
-    return features
-
 
 def _build_ped_stack(
     ped_feats_raw: list[np.ndarray],
     num_frames: int,
     top_k: int,
-    speed_stats: SpeedStats | None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Resample, normalize, and stack top-K ped features.
+    """Resample and stack top-K ped features.
 
     Returns:
         ped_feat      : (top_k * num_frames, 3)
@@ -84,8 +76,6 @@ def _build_ped_stack(
 
     for pf in ped_feats_raw[:top_k]:
         pf_r, p_len = _resample_trajectory(pf, num_frames)
-        if speed_stats is not None:
-            pf_r = _apply_speed_stats(pf_r, speed_stats.p_speed_mean, speed_stats.p_speed_std)
         mask = np.zeros(num_frames, dtype=bool)
         mask[p_len:] = True
         p_arrs.append(pf_r)
@@ -111,7 +101,6 @@ def build_events_with_scores(
     num_frames: int = 32,
     top_k: int = DEFAULT_TOP_K,
     batch_size: int = 64,
-    speed_stats: SpeedStats | None = None,
 ) -> list[dict]:
     """Build events for GT-labeled interactions and score them with the model.
 
@@ -170,15 +159,13 @@ def build_events_with_scores(
 
                 _, _, vehicle_feat_raw, ped_feats_raw = _build_group_trajectory(group, top_k)
 
-                # Vehicle: resample, normalize, build mask
+                # Vehicle: resample and build mask
                 v_arr, v_len = _resample_trajectory(vehicle_feat_raw, num_frames)
-                if speed_stats is not None:
-                    v_arr = _apply_speed_stats(v_arr, speed_stats.v_speed_mean, speed_stats.v_speed_std)
                 v_mask = np.zeros(num_frames, dtype=bool)
                 v_mask[v_len:] = True
 
-                # Pedestrians: resample, normalize, stack, mask
-                p_arr, p_mask = _build_ped_stack(ped_feats_raw, num_frames, top_k, speed_stats)
+                # Pedestrians: resample, stack, mask
+                p_arr, p_mask = _build_ped_stack(ped_feats_raw, num_frames, top_k)
 
                 events.append({
                     "video_id":    vid,
@@ -264,15 +251,10 @@ def main() -> None:
     logger.info(f"Loaded checkpoint: {args.checkpoint.name}  "
                 f"(epoch {ckpt['epoch']}, val_acc={ckpt['val_acc']:.2f}%)")
 
-    speed_stats = None
-    if ckpt.get("speed_stats"):
-        speed_stats = SpeedStats(**ckpt["speed_stats"])
-        logger.info(f"Loaded speed stats from checkpoint: {speed_stats}")
-
     predictions = build_events_with_scores(
         args.parquet_dir, args.labels_pkl, video_ids, model, device,
         num_frames=args.num_frames, top_k=args.top_k,
-        batch_size=args.batch_size, speed_stats=speed_stats,
+        batch_size=args.batch_size,
     )
 
     result = compute_map(predictions, eiou_threshold=args.eiou_threshold)

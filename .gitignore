@@ -11,3 +11,4 @@ CLAUDE.md
 results/
 logs/
 training/summarize.md
+*.zip
