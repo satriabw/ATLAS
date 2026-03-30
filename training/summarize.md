@@ -57,6 +57,8 @@ ped_feat (T, 3)     = [p_loc_x_rel, p_loc_y_rel, p_speed]
 
 Vehicle trajectory is **ego-centered** (origin at first position). Pedestrian location is expressed relative to the vehicle at each frame.
 
+If no pedestrian is present in an interaction, `has_pedestrian=False` is set and the event is automatically classified as **non-violation** (score zeroed, not passed through the model).
+
 ### Normalization (`_zscore_speed`)
 
 Applied per-sample in `__getitem__` after resampling. The speed column (index 2) of both `vehicle_feat` and `ped_feat` is z-score normalized independently:
@@ -347,7 +349,7 @@ For each labeled event in parquet:
 compute_map(predictions)  → APv, APn, mAP
 ```
 
-Since `eiou = 1.0` for all events, the localization penalty never fires — mAP is a **pure classification quality** measure.
+Since `eiou = 1.0` for all events, the localization penalty never fires — mAP is a **pure classification quality** measure. The test split uses `test_labels.pkl`.
 
 ---
 
@@ -382,3 +384,115 @@ Label PKL      ──► build_gt_events()
                compute_localization_rate()   → coverage check
                compute_map()                 → APv, APn, mAP
 ```
+
+---
+
+## 5. Comparison: ATLAS vs. `crossswalk-original` + `ap_cal.py`
+
+This section documents how the original crosswalk pipeline (`crossswalk-original/`) and its AP evaluator (`ap_cal.py`) relate to ATLAS.
+
+---
+
+### 5.1 Original Pipeline Overview (`crossswalk-original/`)
+
+The original system is a multi-stage preprocessing pipeline that works in **pixel/image space** from raw tracking output.
+
+**Stage 1 — `filtering_1.py` (vehicle–pedestrian co-occurrence)**
+```
+tracking_output/*.txt (per-frame bounding boxes: vehicle + pedestrian)
+    ↓
+For each frame:
+    Find vehicles intersecting crosswalk line segments (TOP or BOT region)
+    Find pedestrians inside crosswalk polygon
+    Only keep vehicles when pedestrians are also present in same region
+    ↓
+filtering_output/video_NNN_{top,bot}.txt
+```
+
+**Stage 2 — `filtering_2.py` (vehicle-only baseline)**
+```
+filtering_output/  (with-pedestrian vehicle tracks)
+    ↓
+Collect all vehicle IDs that ever appeared with pedestrians
+Re-read tracking_output, keep those vehicles intersecting crosswalk lines
+    (regardless of pedestrian presence)
+    ↓
+filtering_woatt_output/video_NNN_woatt_{top,bot}.txt
+```
+"woatt" = without attention = vehicle-only temporal extent.
+
+**Stage 3 — `filtering_3.py` (summarize first/last appearance)**
+```
+filtering_woatt_output/
+    ↓
+For each vehicle ID: record first and last frame + bbox
+Discard interactions shorter than 32 frames
+    ↓
+filtering_woatt_summary/video_NNN_woatt_{top,bot}.txt
+```
+
+**Stage 4a — `preprocessing_vr.py` (video representation)**
+```
+For each GT label (from label_txt/):
+    Spatiotemporally match GT to detected events in filtering_woatt_summary/
+    using: EIoU = tIoU × (sIoU_start + sIoU_end)
+        where sIoU = pixel bounding-box overlap IoU
+    Crop 32 uniformly-sampled video frames from intersection-video/
+        using one of 4 fixed crop rectangles (crop_lt, crop_rt, crop_lb, crop_rb)
+    ↓
+vr/V{vid}I{id}S{roi}D{dir}R0A{label}/  (folder of frame images)
+```
+
+**Stage 4b — `preprocessing_rr.py` (trajectory representation)**
+```
+Same matching logic as preprocessing_vr.py
+Crop 32 frames from generated_ped_images/ (rendered trajectory frames)
+    ↓
+rr/V{vid}I{id}S{roi}D{dir}R0A{label}/  (folder of trajectory frame images)
+```
+
+Matched GT events get `A0` (violation); unmatched detected events get `A1` (compliance). Both `vr` and `rr` can be combined as `mr` (merged representation) for multi-modal models.
+
+---
+
+### 5.2 AP Evaluator: `ap_cal.py` vs. `ap_calculator.py`
+
+| Aspect | Original `ap_cal.py` | ATLAS `ap_calculator.py` |
+|--------|----------------------|--------------------------|
+| **Dependency** | `sklearn.metrics.average_precision_score` | Pure numpy, no sklearn |
+| **Score input** | Pre-computed scores loaded from `score_dir/*.pkl` | Computed inline from model softmax |
+| **EIoU input** | Loaded from `eiou_values_updated.txt` (pre-computed) | Computed live via `calculate_world_eiou()` |
+| **EIoU space** | Pixel bounding-box space (sIoU = box overlap) | World space (SPIoU = proximity in metres) |
+| **Localization penalty** | Same logic: if `predicted_class == gt_label AND eiou ≤ threshold` → score zeroed | Same logic |
+| **AP curve** | sklearn handles interpolation internally | Explicit trapezoidal rule on precision-recall curve |
+| **Classes** | pos_label=0 (violation), pos_label=1 (compliance) | APv (score), APn (score_n) |
+| **mAP** | `(AP-V + AP-N) / 2` | `(APv + APn) / 2` |
+
+The penalty logic is **identical** in both systems: a prediction with correct class but insufficient localization (`eiou ≤ threshold`) has its score zeroed, pushing it to the bottom of the ranked list and acting as a false positive.
+
+---
+
+### 5.3 Key Differences: ATLAS vs. Original
+
+| Dimension | Original (`crossswalk-original`) | ATLAS (`f-trajectory-only`) |
+|-----------|-----------------------------------|-----------------------------|
+| **Input space** | Pixel-space bounding boxes (image coordinates) | World-space coordinates (metres, from parquet) |
+| **Spatial EIoU** | `sIoU = bounding-box pixel overlap` | `SPIoU = max(0, 1 − dist/5m)` — distance-based |
+| **Feature modality** | Image crops (video frames, trajectory renders) | Numerical trajectory: `[x, y, speed]` per frame |
+| **Multi-modal** | Yes: `vr` (video), `rr` (trajectory images), `mr` (both) | No: trajectory numerics only |
+| **Event detection** | 3-stage pixel-space filtering pipeline | Parquet groupby `(v_track_id, roi)` |
+| **GT matching** | Explicit spatiotemporal matching at preprocessing time | GT proxied directly from same parquet group (eiou=1.0) |
+| **No-pedestrian handling** | Not applicable (filtering_1 requires co-occurrence) | Auto non-violation (`has_pedestrian=False`) |
+| **Model** | Video backbone (MAN, SlowFast, I3D, ViT, etc.) + trajectory head | BiGRU × 2 + cross-attention |
+| **Coordinate system** | Image pixels; direction-aware (downward/upward) | Ego-centered world coords; pedestrian relative to vehicle |
+| **Data format** | Folder of frame images per event | Parquet file per video |
+
+---
+
+### 5.4 Design Decisions in ATLAS
+
+1. **World-space over pixel-space**: SPIoU based on metric distance is more physically interpretable and robust to camera perspective distortion.
+2. **Numerical trajectory over image crops**: Avoids high-dimensional visual features; faster to train; no dependency on video storage.
+3. **Cross-attention**: Allows the model to learn which pedestrian frames are most relevant to the vehicle's decision-making context, replacing the implicit co-occurrence filter of `filtering_1.py`.
+4. **Unified data format**: A single parquet per video replaces the multi-stage txt file pipeline, simplifying preprocessing and reducing pipeline fragility.
+5. **Live EIoU**: Computed at evaluation time rather than precomputed offline, enabling evaluation on arbitrary video subsets without regenerating files.

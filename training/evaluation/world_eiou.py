@@ -7,13 +7,13 @@ import numpy as np
 
 
 def calculate_tiou(pred_start: int, pred_end: int, gt_start: int, gt_end: int) -> float:
-    """Temporal IoU between two frame ranges [start, end] (inclusive)."""
+    """Temporal IoU between two frame ranges [start, end] (exclusive end)."""
     inter_start = max(pred_start, gt_start)
     inter_end = min(pred_end, gt_end)
-    inter = max(0, inter_end - inter_start + 1)
+    inter = max(0, inter_end - inter_start)
     if inter == 0:
         return 0.0
-    union = (pred_end - pred_start + 1) + (gt_end - gt_start + 1) - inter
+    union = (pred_end - pred_start) + (gt_end - gt_start) - inter
     return float(inter) / float(union)
 
 
