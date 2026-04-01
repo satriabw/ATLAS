@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from dataset.violation_dataset import load_violation_dataset
-from models import CrossAttentionModel
+from models import CrossAttentionModel, FusedModel
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,7 +23,13 @@ def _forward(model, batch, device):
     v_padding_mask = batch['v_padding_mask'].to(device)
     p_padding_mask = batch['p_padding_mask'].to(device)
     labels         = batch['label'].to(device)
-    logits = model(vehicle_feat, ped_feat, v_padding_mask, p_padding_mask)
+
+    if 'frames' in batch:
+        frames = batch['frames'].to(device)
+        logits = model(vehicle_feat, ped_feat, frames, v_padding_mask, p_padding_mask)
+    else:
+        logits = model(vehicle_feat, ped_feat, v_padding_mask, p_padding_mask)
+
     return logits, labels
 
 
@@ -75,7 +81,12 @@ def train(args, train_dataset, val_dataset, criterion):
     logger.info(f"Using device: {device}")
     logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
-    model     = CrossAttentionModel(num_classes=2).to(device)
+    if args.use_vision:
+        model = FusedModel(num_classes=2).to(device)
+        logger.info("Using FusedModel (trajectory + vision)")
+    else:
+        model = CrossAttentionModel(num_classes=2).to(device)
+        logger.info("Using CrossAttentionModel (trajectory only)")
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=10,
@@ -124,35 +135,49 @@ def main():
     parser.add_argument('--lr',         type=float, default=1e-4)
     parser.add_argument('--top_k',      type=int,   default=5,
                         help='Number of closest pedestrians to use per event')
+    parser.add_argument('--use_vision', action='store_true',
+                        help='Include vision branch (ResNet18 frame features)')
+    parser.add_argument('--overfit',    action='store_true',
+                        help='Overfit test: train on video_001 only, no val split')
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
     device    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    logger.info("Loading train dataset from train_labels.pkl")
-    full_dataset = load_violation_dataset(
-        data_root=data_root, label_file='train', num_frames=32, top_k=args.top_k,
-    )
+    if args.overfit:
+        logger.info("=== OVERFIT MODE: video_001 only ===")
+        full_dataset = load_violation_dataset(
+            data_root=data_root, label_file='train', num_frames=32, top_k=args.top_k,
+            video_filter='video_001', use_vision=args.use_vision,
+        )
+        train_dataset = full_dataset
+        val_dataset   = full_dataset  # same set — just checking if loss → 0
+        train_labels  = [lbl.annotation for lbl in full_dataset.labels]
+    else:
+        logger.info("Loading train dataset from train_labels.pkl")
+        full_dataset = load_violation_dataset(
+            data_root=data_root, label_file='train', num_frames=32, top_k=args.top_k,
+            use_vision=args.use_vision,
+        )
 
-    # Scene-stratified 85/15 split: all events from the same video go to the same split.
-    # Shuffle before splitting so the val set isn't biased toward late-recorded videos.
-    all_videos = sorted({lbl.video_id for lbl in full_dataset.labels})
-    random.seed(42)
-    random.shuffle(all_videos)
-    n_val_videos   = max(1, round(0.15 * len(all_videos)))
-    val_video_set  = set(all_videos[-n_val_videos:])
-    train_video_set = set(all_videos) - val_video_set
+        # Scene-stratified 85/15 split: all events from the same video go to the same split.
+        all_videos = sorted({lbl.video_id for lbl in full_dataset.labels})
+        random.seed(42)
+        random.shuffle(all_videos)
+        n_val_videos    = max(1, round(0.15 * len(all_videos)))
+        val_video_set   = set(all_videos[-n_val_videos:])
+        train_video_set = set(all_videos) - val_video_set
 
-    train_indices = [i for i, lbl in enumerate(full_dataset.labels) if lbl.video_id in train_video_set]
-    val_indices   = [i for i, lbl in enumerate(full_dataset.labels) if lbl.video_id in val_video_set]
+        train_indices = [i for i, lbl in enumerate(full_dataset.labels) if lbl.video_id in train_video_set]
+        val_indices   = [i for i, lbl in enumerate(full_dataset.labels) if lbl.video_id in val_video_set]
 
-    logger.info(f"Train videos ({len(train_video_set)}): {sorted(train_video_set)}")
-    logger.info(f"Val videos   ({len(val_video_set)}): {sorted(val_video_set)}")
+        logger.info(f"Train videos ({len(train_video_set)}): {sorted(train_video_set)}")
+        logger.info(f"Val videos   ({len(val_video_set)}): {sorted(val_video_set)}")
 
-    train_dataset = Subset(full_dataset, train_indices)
-    val_dataset   = Subset(full_dataset, val_indices)
+        train_dataset = Subset(full_dataset, train_indices)
+        val_dataset   = Subset(full_dataset, val_indices)
+        train_labels  = [full_dataset.labels[i].annotation for i in train_indices]
 
-    train_labels = [full_dataset.labels[i].annotation for i in train_indices]
     logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
     logger.info(f"Train label distribution: Violations (0)={train_labels.count(0)}, "
                 f"Compliance (1)={train_labels.count(1)}")

@@ -1,9 +1,11 @@
 import logging
 import re
+import cv2
 import numpy as np
 import pandas as pd
 import pickle
 import torch
+import torchvision.transforms.functional as TF
 from dataclasses import dataclass
 from torch.utils.data import Dataset
 from pathlib import Path
@@ -12,7 +14,6 @@ from typing import Dict, List, Optional, Tuple, Union
 logger = logging.getLogger(__name__)
 
 DEFAULT_TOP_K = 5
-
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -226,6 +227,49 @@ def _assemble_labels(parsed: List[Tuple], frame_ranges: Dict) -> List[ViolationL
 
 
 # ---------------------------------------------------------------------------
+# Video frame loading
+# ---------------------------------------------------------------------------
+
+_IMAGENET_MEAN = [0.485, 0.456, 0.406]
+_IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+
+def _load_frames(
+    video_path: Path,
+    start_frame: int,
+    end_frame: int,
+    num_frames: int,
+    size: int = 224,
+) -> torch.Tensor:
+    """Extract `num_frames` evenly-spaced frames from a video clip.
+
+    Returns:
+        Tensor of shape (num_frames, 3, size, size), ImageNet-normalised.
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    indices = np.linspace(start_frame, end_frame, num_frames, dtype=int)
+
+    out = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        ret, frame = cap.read()
+        if ret:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.resize(frame, (size, size))
+        else:
+            frame = np.zeros((size, size, 3), dtype=np.uint8)
+        out.append(frame)
+
+    cap.release()
+
+    # (num_frames, H, W, 3) → (num_frames, 3, H, W), float [0,1]
+    tensor = torch.from_numpy(np.stack(out)).permute(0, 3, 1, 2).float() / 255.0
+    mean = torch.tensor(_IMAGENET_MEAN).view(1, 3, 1, 1)
+    std  = torch.tensor(_IMAGENET_STD).view(1, 3, 1, 1)
+    return (tensor - mean) / std
+
+
+# ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
@@ -236,12 +280,15 @@ class ViolationDataset(Dataset):
         traj_data: Dict[Tuple, Tuple],
         num_frames: int = 32,
         top_k: int = DEFAULT_TOP_K,
+        video_dir: Optional[Path] = None,
     ):
         self.labels     = labels
         self.traj_data  = traj_data
         self.num_frames = num_frames
         self.top_k      = top_k
-        logger.info(f"Initialized dataset with {len(labels)} samples (top_k={top_k})")
+        self.video_dir  = Path(video_dir) if video_dir is not None else None
+        logger.info(f"Initialized dataset with {len(labels)} samples "
+                    f"(top_k={top_k}, vision={'yes' if video_dir else 'no'})")
 
     def __len__(self):
         return len(self.labels)
@@ -251,7 +298,7 @@ class ViolationDataset(Dataset):
         v_feat, p_feat, has_ped, v_mask, p_mask = self._get_modalities(
             label.video_id, label.tracking_id, label.roi
         )
-        return {
+        sample = {
             'vehicle_feat':   v_feat,
             'ped_feat':       p_feat,
             'v_padding_mask': v_mask,
@@ -262,6 +309,14 @@ class ViolationDataset(Dataset):
             'tracking_id':    label.tracking_id,
             'start_frame':    label.start_frame,
         }
+
+        if self.video_dir is not None:
+            video_path = self.video_dir / f'{label.video_id}.avi'
+            sample['frames'] = _load_frames(
+                video_path, label.start_frame, label.end_frame, self.num_frames
+            )
+
+        return sample
 
     def _get_modalities(
         self, video_id: str, tracking_id: int, roi: str
@@ -323,6 +378,7 @@ def load_violation_dataset(
     num_frames: int = 32,
     top_k: int = DEFAULT_TOP_K,
     video_filter: Optional[Union[str, List[str]]] = None,
+    use_vision: bool = False,
 ) -> ViolationDataset:
     data_root = Path(data_root)
     pkl_path  = data_root / 'data' / 'raw' / 'labels' / f'{label_file}_labels.pkl'
@@ -337,7 +393,10 @@ def load_violation_dataset(
     traj_data, frame_ranges = _load_parquet_trajectories(video_ids, parquet_dir, top_k)
     labels = _assemble_labels(parsed, frame_ranges)
 
+    video_dir = data_root / 'data' / 'raw' / 'video' if use_vision else None
+
     return ViolationDataset(
         labels=labels, traj_data=traj_data,
         num_frames=num_frames, top_k=top_k,
+        video_dir=video_dir,
     )

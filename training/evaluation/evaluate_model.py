@@ -1,11 +1,27 @@
 """Run model inference then compute APv, APn, mAP.
 
 Usage (from training/):
+    # CrossAttentionModel (trajectory only)
     python evaluation/evaluate_model.py \
         --checkpoint checkpoints/best_model.pth \
         --parquet-dir /home/satria/Project/ATLAS/data/processed/interactions \
-        --labels-pkl  /home/satria/Project/ATLAS/data/raw/labels/test_labels.pkl \
-        --video-ids   2 4 6 8 10
+        --labels-pkl  /home/satria/Project/ATLAS/data/raw/labels/test_labels.pkl
+
+    # FusedModel (trajectory + video)
+    python evaluation/evaluate_model.py \
+        --checkpoint checkpoints/best_fused.pth \
+        --model-type fused \
+        --video-dir  /home/satria/Project/ATLAS/data/raw/video \
+        --parquet-dir /home/satria/Project/ATLAS/data/processed/interactions \
+        --labels-pkl  /home/satria/Project/ATLAS/data/raw/labels/test_labels.pkl
+
+    # Overfit mode (videos 001-010, uses train labels)
+    python evaluation/evaluate_model.py \
+        --checkpoint checkpoints/best_model.pth \
+        --model-type fused \
+        --video-dir  /home/satria/Project/ATLAS/data/raw/video \
+        --labels-pkl  /home/satria/Project/ATLAS/data/raw/labels/train_labels.pkl \
+        --overfit
 """
 
 from __future__ import annotations
@@ -26,12 +42,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dataset.violation_dataset import (
     _build_group_trajectory,
+    _load_frames,
     _resample_trajectory,
     _to_frames,
     _to_loc,
     DEFAULT_TOP_K,
 )
-from models import CrossAttentionModel
+from models import CrossAttentionModel, FusedModel
 from evaluation.ap_calculator import compute_map
 
 logger = logging.getLogger(__name__)
@@ -101,6 +118,7 @@ def build_events_with_scores(
     num_frames: int = 32,
     top_k: int = DEFAULT_TOP_K,
     batch_size: int = 64,
+    video_dir: Path | None = None,
 ) -> list[dict]:
     """Build events for GT-labeled interactions and score them with the model.
 
@@ -110,6 +128,8 @@ def build_events_with_scores(
         score_n   : float — P(non-violation) = 1 - score
         eiou      : float — 1.0  (GT positions are proxied from this detection)
     """
+    use_vision = video_dir is not None
+
     with open(labels_pkl, "rb") as f:
         label_strings, _ = pickle.load(f)
 
@@ -157,6 +177,9 @@ def build_events_with_scores(
                 frames_cat = frames_cat[order]
                 vloc_cat   = vloc_cat[order]
 
+                start_frame = int(frames_cat[0])
+                end_frame   = int(frames_cat[-1])
+
                 _, _, vehicle_feat_raw, ped_feats_raw = _build_group_trajectory(group, top_k)
 
                 # Vehicle: resample and build mask
@@ -172,8 +195,8 @@ def build_events_with_scores(
                     "v_track_id":  int(v_track_id),
                     "roi":         str(roi),
                     "gt_label":    gt_label,
-                    "frame_start": int(frames_cat[0]),
-                    "frame_end":   int(frames_cat[-1]),
+                    "frame_start": start_frame,
+                    "frame_end":   end_frame,
                     "pos_start":   vloc_cat[0].tolist(),
                     "pos_end":     vloc_cat[-1].tolist(),
                     "eiou":        1.0,
@@ -201,9 +224,22 @@ def build_events_with_scores(
         p_batch  = torch.from_numpy(p_trajs[sl]).to(device)
         vm_batch = torch.from_numpy(v_masks[sl]).to(device)
         pm_batch = torch.from_numpy(p_masks[sl]).to(device)
+
         with torch.no_grad():
-            logits = model(v_batch, p_batch, vm_batch, pm_batch)
-            probs  = F.softmax(logits, dim=1)
+            if use_vision:
+                batch_events = events[start : start + batch_size]
+                frame_tensors = []
+                for ev in batch_events:
+                    vid_path = video_dir / f"{ev['video_id']}.avi"
+                    frame_tensors.append(
+                        _load_frames(vid_path, ev["frame_start"], ev["frame_end"], num_frames)
+                    )
+                frames_batch = torch.stack(frame_tensors).to(device)
+                logits = model(v_batch, p_batch, frames_batch, vm_batch, pm_batch)
+            else:
+                logits = model(v_batch, p_batch, vm_batch, pm_batch)
+
+            probs = F.softmax(logits, dim=1)
             scores.extend(probs[:, 0].cpu().tolist())  # P(violation) = index 0
 
     for ev, sc in zip(events, scores):
@@ -227,34 +263,55 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Evaluate model with World-EIoU AP")
     parser.add_argument("--checkpoint",     type=Path, default=Path("checkpoints/best_model.pth"))
+    parser.add_argument("--model-type",     choices=["cross_attention", "fused"],
+                        default="cross_attention",
+                        help="cross_attention = trajectory only; fused = trajectory + video")
     parser.add_argument("--parquet-dir",    type=Path,
                         default=Path("/home/satria/Project/ATLAS/data/processed/interactions"))
     parser.add_argument("--labels-pkl",     type=Path,
                         default=Path("/home/satria/Project/ATLAS/data/raw/labels/test_labels.pkl"))
+    parser.add_argument("--video-dir",      type=Path, default=None,
+                        help="Directory with <video_id>.avi files (required for --model-type fused)")
     parser.add_argument("--video-ids",      nargs="+", type=int,
                         default=list(range(2, 121, 2)))
+    parser.add_argument("--overfit",        action="store_true",
+                        help="Restrict to videos 001-010 for overfit sanity check")
     parser.add_argument("--num-frames",     type=int,   default=32)
     parser.add_argument("--top-k",          type=int,   default=DEFAULT_TOP_K)
     parser.add_argument("--eiou-threshold", type=float, default=0.5)
-    parser.add_argument("--batch-size",     type=int,   default=64)
+    parser.add_argument("--batch-size",     type=int,   default=16,
+                        help="Batch size (keep small when loading video frames)")
     args = parser.parse_args()
 
-    video_ids = [f"video_{n:03d}" for n in args.video_ids]
+    if args.overfit:
+        video_ids = [f"video_{n:03d}" for n in range(1, 11)]
+        args.labels_pkl = args.labels_pkl.parent / "train_labels.pkl"
+        logger.info("Overfit mode: evaluating on videos 001-010, using train_labels.pkl")
+    else:
+        video_ids = [f"video_{n:03d}" for n in args.video_ids]
     logger.info(f"Videos: {video_ids[:5]}{'...' if len(video_ids) > 5 else ''}")
+
+    if args.model_type == "fused" and args.video_dir is None:
+        parser.error("--video-dir is required when --model-type fused")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
 
-    model = CrossAttentionModel(num_classes=2).to(device)
+    if args.model_type == "fused":
+        model = FusedModel(num_classes=2).to(device)
+    else:
+        model = CrossAttentionModel(num_classes=2).to(device)
+
     ckpt  = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     logger.info(f"Loaded checkpoint: {args.checkpoint.name}  "
-                f"(epoch {ckpt['epoch']}, val_acc={ckpt['val_acc']:.2f}%)")
+                f"(epoch {ckpt['epoch']}, val_acc={ckpt.get('val_acc', float('nan')):.2f}%)")
 
     predictions = build_events_with_scores(
         args.parquet_dir, args.labels_pkl, video_ids, model, device,
         num_frames=args.num_frames, top_k=args.top_k,
         batch_size=args.batch_size,
+        video_dir=args.video_dir if args.model_type == "fused" else None,
     )
 
     result = compute_map(predictions, eiou_threshold=args.eiou_threshold)
