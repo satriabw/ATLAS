@@ -77,18 +77,21 @@ def compute_map(
 ) -> dict:
     """Compute APv, APn, mAP.
 
-    APv uses score=P(violation), APn uses score_n=P(non-violation).
+    Label convention (matches training): gt_label=0 → violation, gt_label=1 → compliance.
+    APv uses score=P(violation)      ranked highest first, target_class=0.
+    APn uses score_n=P(compliance)   ranked highest first, target_class=1.
     Predictions with correct class but eiou <= threshold have scores zeroed (poor localization).
     """
     thresholded = []
     for p in predictions:
         p2 = dict(p)
-        predicted_class = 1 if p2["score"] >= 0.5 else 0
+        # score = P(violation) = P(class 0); predicted class 0 when score >= 0.5
+        predicted_class = 0 if p2["score"] >= 0.5 else 1
         if predicted_class == p2["gt_label"] and p2["eiou"] <= eiou_threshold:
             p2["score"]   = 0.0
             p2["score_n"] = 0.0
         thresholded.append(p2)
 
-    apv  = compute_ap(thresholded, target_class=1, score_key="score")
-    apn  = compute_ap(thresholded, target_class=0, score_key="score_n")
+    apv  = compute_ap(thresholded, target_class=0, score_key="score")
+    apn  = compute_ap(thresholded, target_class=1, score_key="score_n")
     return {"APv": apv, "APn": apn, "mAP": (apv + apn) / 2.0}

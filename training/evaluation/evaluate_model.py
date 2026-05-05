@@ -61,7 +61,8 @@ logger = logging.getLogger(__name__)
 def _parse_label_string(s: str):
     """Parse 'V001I00002S1D0R0A1' -> (video_id, track_id, roi, label).
 
-    label=1 → violation, label=0 → non-violation  (event schema convention).
+    Keeps the same convention as the training dataset: label=0 → violation,
+    label=1 → compliance.  compute_map uses target_class=0 for APv.
     """
     m = re.match(r'V(\d+)I(\d+)S(\d)D\d+R\d+A(\d)', s)
     if not m:
@@ -69,8 +70,7 @@ def _parse_label_string(s: str):
     video_id   = f"video_{int(m.group(1)):03d}"
     track_id   = int(m.group(2))
     roi        = 'BOT' if m.group(3) == '1' else 'TOP'
-    annotation = int(m.group(4))   # 0=violation, 1=compliance in pkl
-    label      = 1 if annotation == 0 else 0
+    label      = int(m.group(4))   # 0=violation, 1=compliance (matches training)
     return video_id, track_id, roi, label
 
 
@@ -298,9 +298,9 @@ def main() -> None:
     logger.info(f"Device: {device}")
 
     if args.model_type == "fused":
-        model = FusedModel(num_classes=2).to(device)
+        model = FusedModel(num_classes=2, top_k=args.top_k, num_frames=args.num_frames).to(device)
     else:
-        model = CrossAttentionModel(num_classes=2).to(device)
+        model = CrossAttentionModel(num_classes=2, top_k=args.top_k, num_frames=args.num_frames).to(device)
 
     ckpt  = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])

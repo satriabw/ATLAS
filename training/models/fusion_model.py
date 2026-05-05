@@ -5,8 +5,17 @@ from .vision_encoder import VisionEncoder
 
 
 class CrossAttentionModel(nn.Module):
-    def __init__(self, hidden_dim: int = 128, num_heads: int = 4, num_classes: int = 2):
+    def __init__(
+        self,
+        hidden_dim: int = 128,
+        num_heads: int = 4,
+        num_classes: int = 2,
+        top_k: int = 5,
+        num_frames: int = 32,
+    ):
         super().__init__()
+        self.top_k = top_k
+        self.num_frames = num_frames
         self.vehicle_encoder = TrajectoryEncoder(input_dim=3, hidden_dim=hidden_dim)
         self.ped_encoder = TrajectoryEncoder(input_dim=3, hidden_dim=hidden_dim)
         self.cross_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, batch_first=True)
@@ -19,26 +28,51 @@ class CrossAttentionModel(nn.Module):
 
     def forward(
         self,
-        vehicle_feat: torch.Tensor,
-        ped_feat: torch.Tensor,
+        vehicle_feat: torch.Tensor,           # (B, T_v, 3)
+        ped_feat: torch.Tensor,               # (B, top_k * num_frames, 3)
         v_padding_mask: torch.Tensor = None,  # (B, T_v)  True = padded
-        p_padding_mask: torch.Tensor = None,  # (B, T_p)  True = padded
+        p_padding_mask: torch.Tensor = None,  # (B, top_k * num_frames)  True = padded
     ) -> torch.Tensor:
-        vehicle_enc = self.vehicle_encoder(vehicle_feat)  # (B, T_v, 128)
-        ped_enc     = self.ped_encoder(ped_feat)          # (B, T_p, 128)
+        B = vehicle_feat.shape[0]
 
-        # Cross-attention: vehicle queries pedestrian sequence.
-        # key_padding_mask marks padded ped positions so attention ignores them.
+        vehicle_enc = self.vehicle_encoder(vehicle_feat)  # (B, T_v, H)
+
+        # Process each pedestrian trajectory independently through the encoder.
+        # Reshaping to (B*K, num_frames, 3) ensures the GRU hidden state is reset
+        # between pedestrians and does not bleed across pedestrian boundaries.
+        ped_flat = ped_feat.view(B * self.top_k, self.num_frames, -1)   # (B*K, T_p, 3)
+        ped_enc_flat = self.ped_encoder(ped_flat)                        # (B*K, T_p, H)
+
+        if p_padding_mask is not None:
+            p_mask_flat = p_padding_mask.view(B * self.top_k, self.num_frames)  # (B*K, T_p)
+            ped_enc_flat = ped_enc_flat.masked_fill(p_mask_flat.unsqueeze(-1), float('-inf'))
+
+        # Pool each pedestrian to a single context vector.
+        ped_enc_pooled = ped_enc_flat.max(dim=1).values          # (B*K, H)
+        # Dummy (all-padded) pedestrians produce -inf; replace with zeros so they
+        # carry no information when used as attention keys.
+        ped_enc_pooled = torch.nan_to_num(ped_enc_pooled, neginf=0.0)
+        ped_enc = ped_enc_pooled.view(B, self.top_k, -1)         # (B, K, H)
+
+        # Per-pedestrian key padding mask: True if the entire track is dummy/padded.
+        if p_padding_mask is not None:
+            ped_key_mask = (
+                p_padding_mask.view(B, self.top_k, self.num_frames).all(dim=-1)
+            )  # (B, K)
+        else:
+            ped_key_mask = None
+
+        # Cross-attention: vehicle queries pedestrian encodings.
         attended, _ = self.cross_attn(
             query=vehicle_enc, key=ped_enc, value=ped_enc,
-            key_padding_mask=p_padding_mask,
-        )
+            key_padding_mask=ped_key_mask,
+        )  # (B, T_v, H)
 
         # Mask padded vehicle positions before max-pool so they don't win.
         if v_padding_mask is not None:
             attended = attended.masked_fill(v_padding_mask.unsqueeze(-1), float('-inf'))
 
-        pooled = attended.max(dim=1).values  # (B, 128)
+        pooled = attended.max(dim=1).values  # (B, H)
         return self.classifier(pooled)
 
 
@@ -46,7 +80,7 @@ class FusedModel(nn.Module):
     """Vision-queries-trajectory cross-attention fusion.
 
     Step 1 — trajectory interaction:
-        vehicle_enc  (B, T_v, H)  queries  ped_enc  (B, T_p, H)
+        vehicle_enc  (B, T_v, H)  queries  ped_enc  (B, K, H)
         → traj_context  (B, T_v, H)   [vehicle-ped interaction features]
 
     Step 2 — vision queries trajectory:
@@ -54,7 +88,7 @@ class FusedModel(nn.Module):
         → fused  (B, F, H)             [vision grounded in trajectory]
 
     Step 3 — pool + classify:
-        mean-pool over F frames  →  (B, H)  →  MLP  →  logits
+        max-pool over T_v and F frames  →  (B, H)  →  MLP  →  logits
     """
 
     def __init__(
@@ -64,8 +98,13 @@ class FusedModel(nn.Module):
         num_classes: int = 2,
         vision_backbone_dim: int = 512,
         freeze_vision: bool = False,
+        top_k: int = 5,
+        num_frames: int = 32,
     ):
         super().__init__()
+        self.top_k = top_k
+        self.num_frames = num_frames
+
         # Trajectory branch
         self.vehicle_encoder  = TrajectoryEncoder(input_dim=3, hidden_dim=hidden_dim)
         self.ped_encoder      = TrajectoryEncoder(input_dim=3, hidden_dim=hidden_dim)
@@ -95,17 +134,38 @@ class FusedModel(nn.Module):
     def forward(
         self,
         vehicle_feat: torch.Tensor,         # (B, T_v, 3)
-        ped_feat: torch.Tensor,             # (B, T_p, 3)
+        ped_feat: torch.Tensor,             # (B, top_k * num_frames, 3)
         frames: torch.Tensor,               # (B, num_frames, C, H, W)
         v_padding_mask: torch.Tensor = None,
         p_padding_mask: torch.Tensor = None,
     ) -> torch.Tensor:
+        B = vehicle_feat.shape[0]
+
+        vehicle_enc = self.vehicle_encoder(vehicle_feat)   # (B, T_v, H)
+
+        # Process each pedestrian trajectory independently (same fix as CrossAttentionModel).
+        ped_flat = ped_feat.view(B * self.top_k, self.num_frames, -1)   # (B*K, T_p, 3)
+        ped_enc_flat = self.ped_encoder(ped_flat)                        # (B*K, T_p, H)
+
+        if p_padding_mask is not None:
+            p_mask_flat = p_padding_mask.view(B * self.top_k, self.num_frames)
+            ped_enc_flat = ped_enc_flat.masked_fill(p_mask_flat.unsqueeze(-1), float('-inf'))
+
+        ped_enc_pooled = ped_enc_flat.max(dim=1).values          # (B*K, H)
+        ped_enc_pooled = torch.nan_to_num(ped_enc_pooled, neginf=0.0)
+        ped_enc = ped_enc_pooled.view(B, self.top_k, -1)         # (B, K, H)
+
+        if p_padding_mask is not None:
+            ped_key_mask = (
+                p_padding_mask.view(B, self.top_k, self.num_frames).all(dim=-1)
+            )  # (B, K)
+        else:
+            ped_key_mask = None
+
         # Step 1: vehicle-ped trajectory interaction
-        vehicle_enc  = self.vehicle_encoder(vehicle_feat)   # (B, T_v, H)
-        ped_enc      = self.ped_encoder(ped_feat)            # (B, T_p, H)
         traj_context, _ = self.traj_cross_attn(
             query=vehicle_enc, key=ped_enc, value=ped_enc,
-            key_padding_mask=p_padding_mask,
+            key_padding_mask=ped_key_mask,
         )                                                    # (B, T_v, H)
 
         # Step 2: vision queries trajectory context
@@ -116,10 +176,15 @@ class FusedModel(nn.Module):
             key_padding_mask=v_padding_mask,                 # ignore padded traj steps
         )                                                    # (B, F, H)
 
-        # Step 3: pool + classify
-        # Direct trajectory path (residual) ensures trajectory signal reaches the
-        # classifier even when the vision branch is uninformative.
-        traj_pooled  = traj_context.max(dim=1).values   # (B, H)
-        fused_pooled = fused.max(dim=1).values           # (B, H)
-        pooled = traj_pooled + fused_pooled              # (B, H)
+        # Step 3: pool + classify.
+        # Mask padded vehicle timesteps before pooling so they cannot win max-pool.
+        if v_padding_mask is not None:
+            traj_context_for_pool = traj_context.masked_fill(
+                v_padding_mask.unsqueeze(-1), float('-inf')
+            )
+        else:
+            traj_context_for_pool = traj_context
+        traj_pooled  = traj_context_for_pool.max(dim=1).values  # (B, H)
+        fused_pooled = fused.max(dim=1).values                   # (B, H)
+        pooled = traj_pooled + fused_pooled
         return self.classifier(pooled)
