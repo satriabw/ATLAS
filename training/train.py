@@ -82,10 +82,10 @@ def train(args, train_dataset, val_dataset, criterion):
     logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
     if args.use_vision:
-        model = FusedModel(num_classes=2).to(device)
+        model = FusedModel(num_classes=2, top_k=args.top_k, num_frames=32).to(device)
         logger.info("Using FusedModel (trajectory + vision)")
     else:
-        model = CrossAttentionModel(num_classes=2).to(device)
+        model = CrossAttentionModel(num_classes=2, top_k=args.top_k, num_frames=32).to(device)
         logger.info("Using CrossAttentionModel (trajectory only)")
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
