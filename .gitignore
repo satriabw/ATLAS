@@ -7,7 +7,6 @@ __pycache__/
 *.pyc
 *.pyo
 crosswalk-original/
-CLAUDE.md
 results/
 logs/
 training/summarize.md
