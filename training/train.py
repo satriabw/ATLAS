@@ -112,7 +112,8 @@ def train(args, train_dataset, val_dataset, criterion):
 
         if val_loss == val_loss and val_loss < best_val_loss:
             best_val_loss = val_loss
-            save_path = checkpoint_dir / 'best_model.pth'
+            ckpt_name = 'best_fused.pth' if args.use_vision else 'best_model.pth'
+            save_path = checkpoint_dir / ckpt_name
             torch.save({
                 'epoch':                epoch,
                 'model_state_dict':     model.state_dict(),

@@ -91,6 +91,29 @@ def _extract_row_arrays(
     )
 
 
+def _build_vehicle_feat(group_df: pd.DataFrame) -> np.ndarray:
+    """Vehicle trajectory from all rows in the group, deduplicated by frame.
+
+    Using all rows (not just the primary pedestrian's) ensures the vehicle
+    trajectory covers the full interaction window.
+    """
+    f_parts, loc_parts, sp_parts = [], [], []
+    for _, row in group_df.iterrows():
+        f_parts.append(_to_frames(row['frames']))
+        loc_parts.append(_to_loc(row['v_loc_planar']))
+        sp_parts.append(_to_scalar_seq(row['v_speed']))
+    all_f   = np.concatenate(f_parts)
+    all_loc = np.vstack(loc_parts)
+    all_sp  = np.concatenate(sp_parts)
+    order   = np.argsort(all_f, kind='stable')
+    _, keep = np.unique(all_f[order], return_index=True)
+    idx     = order[keep]
+    v_loc   = all_loc[idx]
+    v_sp    = all_sp[idx].reshape(-1, 1)
+    v_centered = v_loc - v_loc[0:1]
+    return np.concatenate([v_centered, v_sp], axis=1).astype(np.float32)
+
+
 def _build_group_trajectory(
     group_df: pd.DataFrame,
     top_k: int = DEFAULT_TOP_K,
@@ -122,11 +145,7 @@ def _build_group_trajectory(
     else:
         top_ped_ids = list(ped_ids[:top_k])
 
-    # Vehicle trajectory from the closest pedestrian's rows
-    primary_rows = group_df[group_df['p_track_id'] == top_ped_ids[0]]
-    _, v_loc, v_sp, _, _ = _extract_row_arrays(primary_rows)
-    v_centered   = v_loc - v_loc[0:1]
-    vehicle_feat = np.concatenate([v_centered, v_sp], axis=1).astype(np.float32)
+    vehicle_feat = _build_vehicle_feat(group_df)
 
     # Pedestrian trajectories for each selected ped
     ped_feats: List[np.ndarray] = []
@@ -240,6 +259,7 @@ def _load_frames(
     end_frame: int,
     num_frames: int,
     size: int = 224,
+    roi: Optional[str] = None,
 ) -> torch.Tensor:
     """Extract `num_frames` evenly-spaced frames from a video clip.
 

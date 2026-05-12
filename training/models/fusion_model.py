@@ -67,12 +67,14 @@ class CrossAttentionModel(nn.Module):
             query=vehicle_enc, key=ped_enc, value=ped_enc,
             key_padding_mask=ped_key_mask,
         )  # (B, T_v, H)
+        attended = attended + vehicle_enc  # residual: preserve vehicle kinematics
 
         # Mask padded vehicle positions before max-pool so they don't win.
         if v_padding_mask is not None:
             attended = attended.masked_fill(v_padding_mask.unsqueeze(-1), float('-inf'))
 
         pooled = attended.max(dim=1).values  # (B, H)
+        pooled = torch.nan_to_num(pooled, neginf=0.0)
         return self.classifier(pooled)
 
 
@@ -125,7 +127,7 @@ class FusedModel(nn.Module):
         )
 
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
+            nn.Linear(hidden_dim * 2, 64),
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(64, num_classes),
@@ -167,6 +169,7 @@ class FusedModel(nn.Module):
             query=vehicle_enc, key=ped_enc, value=ped_enc,
             key_padding_mask=ped_key_mask,
         )                                                    # (B, T_v, H)
+        traj_context = traj_context + vehicle_enc            # residual: preserve vehicle kinematics
 
         # Step 2: vision queries trajectory context
         vis_frames = self.vision_encoder(frames)             # (B, F, backbone_dim)
@@ -185,6 +188,8 @@ class FusedModel(nn.Module):
         else:
             traj_context_for_pool = traj_context
         traj_pooled  = traj_context_for_pool.max(dim=1).values  # (B, H)
+        traj_pooled  = torch.nan_to_num(traj_pooled, neginf=0.0)
         fused_pooled = fused.max(dim=1).values                   # (B, H)
-        pooled = traj_pooled + fused_pooled
+        fused_pooled = torch.nan_to_num(fused_pooled, neginf=0.0)
+        pooled = torch.cat([traj_pooled, fused_pooled], dim=-1)  # (B, 2H)
         return self.classifier(pooled)

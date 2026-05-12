@@ -33,7 +33,7 @@ python evaluation/evaluate_model.py \
     --labels-pkl  /path/to/ATLAS/data/raw/labels/test_labels.pkl
 ```
 
-Key training flags: `--top_k` (pedestrians per event, default 5), `--lr`, `--batch_size`. Checkpoints saved to `training/checkpoints/best_model.pth`.
+Key training flags: `--top_k` (pedestrians per event, default 5), `--lr`, `--batch_size`. Checkpoints saved to `training/checkpoints/best_model.pth` (trajectory-only) or `best_fused.pth` (fused).
 
 ## Architecture
 
@@ -56,7 +56,7 @@ data/raw/video/video_NNN.avi       # only needed with --use_vision
 `load_violation_dataset()` in `dataset/violation_dataset.py`:
 1. Parses `.pkl` label file → list of `(video_id, tracking_id, roi, annotation)`.
 2. Loads parquet files and builds trajectory cache: groups by `(v_track_id, roi)`, selects top-K closest pedestrians by mean `d_min`, resamples trajectories to `num_frames`.
-3. Features are relative/centered: vehicle trajectory is centered at its first position; pedestrian features are relative to the vehicle.
+3. Features are relative/centered: vehicle trajectory is centered at its first position (`_build_vehicle_feat` aggregates all rows in the group and deduplicates by frame, so the window covers the full interaction span); pedestrian features are relative to the vehicle at each timestep.
 4. Trajectories resampled or zero-padded to `num_frames`; padding tracked via boolean masks (True = padded, should be ignored).
 
 Train/val split is **scene-stratified by video**: all events from a given video go to the same split (85/15 by video count, seed 42).
@@ -68,14 +68,14 @@ Train/val split is **scene-stratified by video**: all events from a given video 
 **`CrossAttentionModel`** (trajectory only):
 1. Encodes vehicle trajectory → `(B, T_v, H)`.
 2. Encodes each pedestrian trajectory independently (reshaped to `(B*K, T_p, 3)` to avoid GRU hidden state bleeding across pedestrians), max-pools to `(B, K, H)`.
-3. Cross-attention: vehicle queries pedestrian encodings.
-4. Max-pool over vehicle timesteps → MLP classifier.
+3. Cross-attention: vehicle queries pedestrian encodings; residual `+ vehicle_enc` preserves vehicle kinematics in the output.
+4. Mask padded positions, max-pool over vehicle timesteps, `nan_to_num` guard → MLP classifier.
 
 **`FusedModel`** (trajectory + vision):
 - Adds `VisionEncoder` (ResNet18 backbone, AdaptiveAvgPool, Linear projection).
-- Step 1: same vehicle-queries-pedestrian cross-attention → `traj_context (B, T_v, H)`.
-- Step 2: vision frame features projected to `H`, then vision queries trajectory context via a second cross-attention.
-- Step 3: max-pool both `traj_context` and `fused` outputs, sum them, classify.
+- Step 1: vehicle-queries-pedestrian cross-attention + residual `+ vehicle_enc` → `traj_context (B, T_v, H)`.
+- Step 2: vision frame features projected to `H`, then vision queries `traj_context` via a second cross-attention → `fused (B, F, H)`.
+- Step 3: max-pool `traj_context` and `fused` independently, **concatenate** to `(B, 2H)`, classify via Linear(2H→64).
 
 ### Evaluation (`training/evaluation/`)
 
