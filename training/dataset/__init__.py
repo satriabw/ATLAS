@@ -1,3 +1,3 @@
-from .violation_dataset import ViolationDataset
+from .loader import ViolationDataset, load_violation_dataset
 
-__all__ = ['ViolationDataset']
+__all__ = ['ViolationDataset', 'load_violation_dataset']

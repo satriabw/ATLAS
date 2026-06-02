@@ -11,3 +11,6 @@ results/
 logs/
 training/summarize.md
 *.zip
+.claude/
+.env
+CLAUDE.md

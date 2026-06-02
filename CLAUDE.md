@@ -4,85 +4,120 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-All scripts are run from the `training/` directory (it uses relative imports):
+All training/evaluation scripts must be run from the `training/` directory (they use relative imports):
 
 ```bash
-cd training/
-
 # Train trajectory-only model
-python train.py --data_root /path/to/ATLAS --epochs 20 --batch_size 2
+cd training && python train.py --data_root /home/satria/Project/ATLAS --epochs 20 --batch_size 2
 
-# Train with vision branch (ResNet18 + trajectory fusion)
-python train.py --data_root /path/to/ATLAS --use_vision
+# Train with vision fusion
+cd training && python train.py --data_root /home/satria/Project/ATLAS --use_vision --epochs 20
 
-# Overfit sanity check on video_001
-python train.py --data_root /path/to/ATLAS --overfit
+# Overfit on video_001 for sanity-checking
+cd training && python train.py --data_root /home/satria/Project/ATLAS --overfit
 
-# Evaluate (trajectory-only)
-python evaluation/evaluate_model.py \
-    --checkpoint checkpoints/best_model.pth \
-    --parquet-dir /path/to/ATLAS/data/processed/interactions \
-    --labels-pkl  /path/to/ATLAS/data/raw/labels/test_labels.pkl
+# Evaluate on test set (even-numbered videos 2–120)
+cd training && python evaluation/evaluate_model.py
 
-# Evaluate (fused model with video)
-python evaluation/evaluate_model.py \
-    --checkpoint checkpoints/best_fused.pth \
-    --model-type fused \
-    --video-dir  /path/to/ATLAS/data/raw/video \
-    --parquet-dir /path/to/ATLAS/data/processed/interactions \
-    --labels-pkl  /path/to/ATLAS/data/raw/labels/test_labels.pkl
+# Evaluate fused model (requires --video-dir for raw .avi files)
+cd training && python evaluation/evaluate_model.py --model-type fused --video-dir /path/to/videos
+
+# Evaluate in overfit mode (video_001, train_labels.pkl)
+cd training && python evaluation/evaluate_model.py --overfit
 ```
 
-Key training flags: `--top_k` (pedestrians per event, default 5), `--lr`, `--batch_size`. Checkpoints saved to `training/checkpoints/best_model.pth` (trajectory-only) or `best_fused.pth` (fused).
+Checkpoints are saved to `training/checkpoints/best_model.pth` (trajectory-only) and `best_fused.pth` (fused).
 
 ## Architecture
 
-ATLAS detects traffic violations by classifying vehicle–pedestrian interaction events using trajectory and optionally video data.
+This is a pedestrian-vehicle traffic violation detection system. A "violation" means a vehicle failed to yield to a pedestrian at a crosswalk. The pipeline:
 
-### Data pipeline
+**Data flow**: Raw videos + labels → interaction parquet files → `ViolationDataset` → model
 
-**Input data layout** (expected under `--data_root`):
+**Label encoding**: `annotation=0` = violation, `annotation=1` = compliance in training labels (pkl file). This is inverted from the evaluation event schema where `gt_label=0` = violation.
+
+**Parquet schema** (`data/processed/interactions/*.parquet`): One row per vehicle-pedestrian pair per segment, grouped by `(v_track_id, roi)` for one interaction event. Array columns (`frames`, `v_loc_planar`, `p_loc_planar`, `v_speed`, `p_speed`) store object-dtype numpy arrays. `roi` is `'TOP'` or `'BOT'`.
+
+**Dataset** (`training/dataset/`):
+- `labels.py`: Parses label strings like `V001I00002S1D0R0A1` → `(video_id, tracking_id, roi, annotation)`
+- `trajectory.py`: Builds per-event trajectory features from parquet groups. Vehicle feature: `(x_centered, y_centered, speed)`. Pedestrian feature: `(rel_x, rel_y, speed)` relative to the vehicle. Top-K pedestrians are selected by minimum average distance.
+- `frames.py`: Loads video frames (OpenCV), resamples to `num_frames`, returns ImageNet-normalized tensor `(F, 3, H, W)`.
+- `loader.py`: `load_violation_dataset()` is the main entry point — parses pkl, loads parquets, builds `ViolationDataset`.
+
+**Models** (`training/models/`):
+- `TrajectoryEncoder`: Bidirectional GRU. Input `(B, T, 3)` → output `(B, T, hidden_dim)`.
+- `CrossAttentionModel`: Vehicle trajectory queries over top-K pedestrian encodings via `nn.MultiheadAttention`, then max-pools over time → 2-class classifier.
+- `FusedModel`: Extends `CrossAttentionModel` with a `VisionEncoder` (ResNet18 backbone). Visual features cross-attend over trajectory context; trajectory and visual pooled vectors are concatenated before classification.
+- `VisionEncoder`: ResNet18 without final layers, applied frame-by-frame `(B, F, C, H, W)` → `(B, F, output_dim)`.
+
+**Training** (`training/train.py`):
+- Scene-level train/val split (15% val by video ID, seed=42) to prevent video leakage.
+- `CrossEntropyLoss` with class weights `[3.5, 1.0]` (violation vs compliance) to handle imbalance.
+- Saves checkpoint on best val loss.
+
+**Evaluation** (`training/evaluation/`):
+- `inference.py`: `build_events_with_scores()` — collects labeled events from parquets, runs batched inference, attaches `score` (P(violation)) and `score_n` (P(compliance)).
+- `ap_calculator.py`: `compute_map()` — computes APv (violation class) and APn (compliance class) using a sorted PR-curve integral. Predictions where the model is correct but `eiou <= threshold` are penalized (score zeroed).
+- `evaluate_model.py`: CLI entry point combining inference + AP reporting.
+
+## Key Invariants
+
+- Vehicle trajectory is centered at first position (`v_centered = v_loc - v_loc[0:1]`).
+- Pedestrian trajectory is expressed relative to the vehicle (`p_rel = p_loc - v_loc`).
+- Padding mask convention: `True` = padded (ignore), `False` = valid — matches PyTorch's `key_padding_mask` semantics.
+- `score` in evaluation events = `softmax(logits)[:, 0]` = P(violation). `score_n = 1 - score`.
+- Test split uses even-numbered videos (2, 4, …, 120); train split uses odd-numbered videos.
+
+## Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+
+## Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+## Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
+## Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
 ```
-data/raw/labels/train_labels.pkl   # pickled (label_strings, _) list
-data/raw/labels/test_labels.pkl
-data/processed/interactions/video_NNN_interactions.parquet   # one per video
-data/raw/video/video_NNN.avi       # only needed with --use_vision
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
 ```
-
-**Label format**: strings like `V001I00002S1D0R0A1` → parsed to `(video_id, tracking_id, roi, annotation)`. Annotation `0`=violation, `1`=compliance.
-
-**Parquet schema**: each row is a vehicle–pedestrian pair with columns `v_track_id`, `roi` (`BOT`/`TOP`), `p_track_id`, `frames`, `v_loc_planar`, `v_speed`, `p_loc_planar`, `p_speed`, `d_min`.
-
-`load_violation_dataset()` in `dataset/violation_dataset.py`:
-1. Parses `.pkl` label file → list of `(video_id, tracking_id, roi, annotation)`.
-2. Loads parquet files and builds trajectory cache: groups by `(v_track_id, roi)`, selects top-K closest pedestrians by mean `d_min`, resamples trajectories to `num_frames`.
-3. Features are relative/centered: vehicle trajectory is centered at its first position (`_build_vehicle_feat` aggregates all rows in the group and deduplicates by frame, so the window covers the full interaction span); pedestrian features are relative to the vehicle at each timestep.
-4. Trajectories resampled or zero-padded to `num_frames`; padding tracked via boolean masks (True = padded, should be ignored).
-
-Train/val split is **scene-stratified by video**: all events from a given video go to the same split (85/15 by video count, seed 42).
-
-### Models (`training/models/`)
-
-**`TrajectoryEncoder`**: Linear(3→64) + ReLU → bidirectional GRU (hidden 128, split 64×2). Input shape `(B, T, 3)`, output `(B, T, 128)`.
-
-**`CrossAttentionModel`** (trajectory only):
-1. Encodes vehicle trajectory → `(B, T_v, H)`.
-2. Encodes each pedestrian trajectory independently (reshaped to `(B*K, T_p, 3)` to avoid GRU hidden state bleeding across pedestrians), max-pools to `(B, K, H)`.
-3. Cross-attention: vehicle queries pedestrian encodings; residual `+ vehicle_enc` preserves vehicle kinematics in the output.
-4. Mask padded positions, max-pool over vehicle timesteps, `nan_to_num` guard → MLP classifier.
-
-**`FusedModel`** (trajectory + vision):
-- Adds `VisionEncoder` (ResNet18 backbone, AdaptiveAvgPool, Linear projection).
-- Step 1: vehicle-queries-pedestrian cross-attention + residual `+ vehicle_enc` → `traj_context (B, T_v, H)`.
-- Step 2: vision frame features projected to `H`, then vision queries `traj_context` via a second cross-attention → `fused (B, F, H)`.
-- Step 3: max-pool `traj_context` and `fused` independently, **concatenate** to `(B, 2H)`, classify via Linear(2H→64).
-
-### Evaluation (`training/evaluation/`)
-
-**`ap_calculator.py`**: Implements `compute_ap` and `compute_map`. APv uses `score=P(violation)` (class 0); APn uses `score_n=P(compliance)` (class 1). Predictions with correct class but `eiou ≤ threshold` have scores zeroed.
-
-**`evaluate_model.py`**: Loads checkpoint, runs batched inference over GT-labeled interactions from parquet files, computes APv / APn / mAP.
-
-### Class imbalance
-
-Training uses weighted CrossEntropyLoss with `weights=[3.5, 1.0]` (violation upweighted). LR scheduler: `ReduceLROnPlateau(factor=0.5, patience=10)`.

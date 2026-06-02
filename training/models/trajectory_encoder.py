@@ -6,7 +6,6 @@ class TrajectoryEncoder(nn.Module):
     def __init__(self, input_dim: int = 3, embed_dim: int = 64, hidden_dim: int = 128):
         super().__init__()
         self.embedding = nn.Linear(input_dim, embed_dim)
-        # Bidirectional GRU: hidden_size = hidden_dim // 2 so output is hidden_dim
         self.gru = nn.GRU(
             input_size=embed_dim,
             hidden_size=hidden_dim // 2,
@@ -14,9 +13,9 @@ class TrajectoryEncoder(nn.Module):
             batch_first=True,
             bidirectional=True,
         )
-        self.output_dim = hidden_dim  # (hidden_dim//2) * 2 directions
+        self.output_dim = hidden_dim
 
     def forward(self, x):
-        x = torch.relu(self.embedding(x))  # (B, T, embed_dim)
+        x = torch.relu(self.embedding(x))
         output, _ = self.gru(x)
         return output
