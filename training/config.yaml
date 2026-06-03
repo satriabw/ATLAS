@@ -5,8 +5,8 @@ top_k: 5
 seed: 42
 patience: 15
 use_vision: false
-h5_path: data/raw/video/frames.h5
 wandb_project: ATLAS
 no_wandb: false
 no_notify: false
+no_amp: false
 run_name: null

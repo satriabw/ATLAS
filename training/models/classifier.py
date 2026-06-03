@@ -70,7 +70,7 @@ class CrossAttentionModel(nn.Module):
 
 
 class FusedModel(nn.Module):
-    def __init__(self, hidden_dim=128, num_heads=4, num_classes=2, vision_backbone_dim=512, freeze_vision=False, top_k=5, num_frames=32):
+    def __init__(self, hidden_dim=128, num_heads=4, num_classes=2, vision_backbone_dim=512, freeze_vision=True, top_k=5, num_frames=32):
         super().__init__()
         self.top_k      = top_k
         self.num_frames = num_frames

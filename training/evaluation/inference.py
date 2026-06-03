@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import logging
 import pickle
-from collections import defaultdict
 from pathlib import Path
 
-import cv2
+import h5py
 import numpy as np
 import pandas as pd
 import torch
@@ -30,66 +29,6 @@ def _build_ped_stack(ped_feats_raw, num_frames, top_k):
         p_masks.append(np.ones(num_frames, dtype=bool))
     return np.concatenate(p_arrs, axis=0), np.concatenate(p_masks, axis=0)
 
-
-def _preload_video_frames(events, video_dir, num_frames, size=224):
-    mean = torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
-    std  = torch.tensor(IMAGENET_STD).view(1, 3, 1, 1)
-
-    vid_to_indices = defaultdict(list)
-    for i, ev in enumerate(events):
-        vid_to_indices[ev["video_id"]].append(i)
-
-    blank_tensor = (torch.zeros(num_frames, 3, size, size) - mean) / std
-
-    frame_tensors = {}
-    for vid_id, ev_indices in vid_to_indices.items():
-        vid_path = video_dir / f"{vid_id}.avi"
-        if not vid_path.exists():
-            logger.warning(f"Video not found: {vid_path}; substituting normalized black frames for {len(ev_indices)} events")
-            for i in ev_indices:
-                frame_tensors[i] = blank_tensor
-            continue
-
-        event_frame_idxs, all_needed = [], set()
-        for i in ev_indices:
-            ev   = events[i]
-            idxs = np.linspace(ev["frame_start"], ev["frame_end"], num_frames, dtype=int).tolist()
-            event_frame_idxs.append((i, idxs))
-            all_needed.update(idxs)
-
-        frame_cache = {}
-        cap = cv2.VideoCapture(str(vid_path))
-        try:
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            for current_idx in range(total_frames):
-                ret, frame = cap.read()
-                if current_idx in all_needed:
-                    if ret:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        frame = cv2.resize(frame, (size, size))
-                    else:
-                        logger.warning(f"{vid_id}: cap.read() failed at frame {current_idx}; substituting black frame")
-                        frame = np.zeros((size, size, 3), dtype=np.uint8)
-                    frame_cache[current_idx] = frame
-                    if len(frame_cache) == len(all_needed):
-                        break
-        finally:
-            cap.release()
-
-        missing = all_needed - set(frame_cache.keys())
-        if missing:
-            sample = sorted(missing)[:5]
-            logger.warning(f"{vid_id}: {len(missing)} frame indices beyond video length ({total_frames} frames): {sample}{'...' if len(missing) > 5 else ''}")
-
-        blank = np.zeros((size, size, 3), dtype=np.uint8)
-        for i, idxs in event_frame_idxs:
-            frames = np.stack([frame_cache.get(idx, blank) for idx in idxs])
-            t = torch.from_numpy(frames).permute(0, 3, 1, 2).float() / 255.0
-            frame_tensors[i] = (t - mean) / std
-
-        logger.info(f"  {vid_id}: loaded {len(all_needed)} unique frames for {len(ev_indices)} events")
-
-    return frame_tensors
 
 
 def _build_event(vid, v_track_id, roi, group, gt_label, num_frames, top_k):
@@ -160,17 +99,25 @@ def _collect_events(parquet_dir, labels_pkl, video_ids, num_frames, top_k):
     return events
 
 
-def _run_inference(model, events, device, num_frames, batch_size, video_dir):
-    use_vision = video_dir is not None
+def _preload_h5_frames(events, h5_path, num_frames):
+    from dataset.frames import load_frames_h5
+    frame_tensors = {}
+    with h5py.File(h5_path, 'r') as hf:
+        for i, ev in enumerate(events):
+            key = f"V{ev['video_id'][-3:]}_{ev['v_track_id']}_{ev['roi']}"
+            frame_tensors[i] = load_frames_h5(hf, key, num_frames)
+    return frame_tensors
 
+
+def _run_inference(model, events, device, num_frames, batch_size, h5_path=None):
     v_trajs = np.stack([e["_v_traj"] for e in events])
     p_trajs = np.stack([e["_p_traj"] for e in events])
     v_masks = np.stack([e["_v_mask"] for e in events])
     p_masks = np.stack([e["_p_mask"] for e in events])
 
-    if use_vision:
-        logger.info("Pre-loading video frames (one pass per video) …")
-        preloaded_frames = _preload_video_frames(events, video_dir, num_frames)
+    if h5_path is not None:
+        logger.info("Pre-loading frames from H5 …")
+        preloaded_frames = _preload_h5_frames(events, h5_path, num_frames)
 
     scores = []
     for start in range(0, len(v_trajs), batch_size):
@@ -181,7 +128,7 @@ def _run_inference(model, events, device, num_frames, batch_size, video_dir):
         pm_batch = torch.from_numpy(p_masks[sl]).to(device)
 
         with torch.no_grad():
-            if use_vision:
+            if h5_path is not None:
                 end = min(start + batch_size, len(v_trajs))
                 frames_batch = torch.stack(
                     [preloaded_frames[i] for i in range(start, end)]
@@ -197,15 +144,23 @@ def _run_inference(model, events, device, num_frames, batch_size, video_dir):
 
 def build_events_with_scores(
     parquet_dir, labels_pkl, video_ids, model, device,
-    num_frames=32, top_k=DEFAULT_TOP_K, batch_size=64, video_dir=None,
+    num_frames=32, top_k=DEFAULT_TOP_K, batch_size=64, h5_path=None,
 ):
     events = _collect_events(parquet_dir, labels_pkl, video_ids, num_frames, top_k)
+    if h5_path is not None:
+        with h5py.File(h5_path, 'r') as hf:
+            h5_keys = set(hf.keys())
+        before = len(events)
+        events = [e for e in events if f"V{e['video_id'][-3:]}_{e['v_track_id']}_{e['roi']}" in h5_keys]
+        skipped = before - len(events)
+        if skipped:
+            logger.warning(f"Skipped {skipped} events with no h5 entry ({len(events)} remain)")
     logger.info(f"Running inference on {len(events)} labeled events …")
     if not events:
         return events
 
     model.eval()
-    scores = _run_inference(model, events, device, num_frames, batch_size, video_dir)
+    scores = _run_inference(model, events, device, num_frames, batch_size, h5_path)
 
     for ev, sc in zip(events, scores):
         ev["score"]   = sc

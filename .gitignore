@@ -14,3 +14,10 @@ training/summarize.md
 .claude/
 .env
 CLAUDE.md
+scripts/compute_dataset_stats.py
+scripts/analyze_trajectory_model.py
+scripts/overfit_fusion.py
+scripts/prep_bev_viz.py
+scripts/validate_h5.py
+scripts/visualize_analysis.py
+scripts/visualize_stats.py

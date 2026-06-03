@@ -19,8 +19,8 @@ cd training && python train.py --data_root /home/satria/Project/ATLAS --overfit
 # Evaluate on test set (even-numbered videos 2–120)
 cd training && python evaluation/evaluate_model.py
 
-# Evaluate fused model (requires --video-dir for raw .avi files)
-cd training && python evaluation/evaluate_model.py --model-type fused --video-dir /path/to/videos
+# Evaluate fused model (h5 path auto-resolved from parquet-dir)
+cd training && python evaluation/evaluate_model.py --model-type fused
 
 # Evaluate in overfit mode (video_001, train_labels.pkl)
 cd training && python evaluation/evaluate_model.py --overfit
@@ -59,6 +59,33 @@ This is a pedestrian-vehicle traffic violation detection system. A "violation" m
 - `inference.py`: `build_events_with_scores()` — collects labeled events from parquets, runs batched inference, attaches `score` (P(violation)) and `score_n` (P(compliance)).
 - `ap_calculator.py`: `compute_map()` — computes APv (violation class) and APn (compliance class) using a sorted PR-curve integral. Predictions where the model is correct but `eiou <= threshold` are penalized (score zeroed).
 - `evaluate_model.py`: CLI entry point combining inference + AP reporting.
+
+## Data Quality
+
+**Label counts (raw pkl files):**
+- `train_labels.pkl`: 3,776 labels
+- `test_labels.pkl`: 3,948 labels
+- Total: 7,724 unique `(video_id, v_track_id, roi)` keys
+
+**Why some labels are skipped at load time:**
+
+Parquets only contain rows where a vehicle and pedestrian **co-occurred in the same frame** inside an ROI polygon. If no such co-occurrence happened, the label has no parquet entry and is silently skipped by `_assemble_labels` in `loader.py`.
+
+After regenerating parquets (2026-06-02), ~88 compliance and 2 violation labels remain without parquet entries. The 2 known violation cases are documented in `data/known_label_issues.yaml`:
+- `video_106 track_id=1316 TOP` — annotation error: the track is a pedestrian, not a vehicle
+- `video_104 track_id=2038 BOT` — ROI annotation error: the vehicle had pedestrian interactions only in TOP, not BOT
+
+**The Track2Data ROI mismatch bug (fixed 2026-06-02):**
+
+The original `extract_pedestrian_vehicle_interactions.py` keyed the `pedestrian_interactions` dict by `p_track_id` alone. Vehicles that crossed both TOP and BOT ROIs were recorded under whichever ROI they first encountered a pedestrian — not the ROI where the labeled interaction occurred. This caused 31 violation labels to have parquets under the wrong ROI.
+
+Fix: key changed to `(p_track_id, v_roi)` so vehicles crossing both ROIs produce separate records per ROI. Parquets were regenerated after this fix.
+
+**H5 frame coverage:**
+- `data/raw/video/frames.h5` has 11,908 keys (all parquet interaction groups, labeled + unlabeled)
+- `load_violation_dataset(..., use_vision=True)` opens h5 at load time and filters out labels whose key is absent, logging a warning
+- After the parquet fix, 30 newly-recovered violation cases have correct parquet entries but no h5 frames yet — they are skipped with a warning until h5 is rebuilt
+- To rebuild h5: run `scripts/build_h5.py` with the raw video zip files available at `data/`
 
 ## Key Invariants
 

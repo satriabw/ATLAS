@@ -31,18 +31,21 @@ def _forward(model, batch, device):
     return logits, labels
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device):
+def train_epoch(model, dataloader, criterion, optimizer, device, scaler, amp_enabled):
     model.train()
     total_loss, correct, total, total_norm = 0, 0, 0, 0.0
 
     for batch in tqdm(dataloader, desc="Training"):
-        logits, labels = _forward(model, batch, device)
-        loss = criterion(logits, labels)
+        with torch.autocast(device_type='cuda', enabled=amp_enabled):
+            logits, labels = _forward(model, batch, device)
+            loss = criterion(logits, labels)
 
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         total_norm += torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf')).item()
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         total_loss += loss.item()
         _, predicted = torch.max(logits, 1)
@@ -104,8 +107,11 @@ def train(args, train_dataset, val_dataset, criterion):
     else:
         model = CrossAttentionModel(num_classes=2, top_k=args.top_k, num_frames=32).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+    optimizer   = torch.optim.Adam(model.parameters(), lr=args.lr)
+    scheduler   = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+    amp_enabled = not args.no_amp and device.type == 'cuda'
+    scaler      = torch.amp.GradScaler('cuda', enabled=amp_enabled)
+    logger.info(f"AMP: {'enabled' if amp_enabled else 'disabled'}")
 
     checkpoint_dir = Path(__file__).parent / 'checkpoints'
     checkpoint_dir.mkdir(exist_ok=True)
@@ -118,13 +124,27 @@ def train(args, train_dataset, val_dataset, criterion):
     if not args.no_notify:
         send_whatsapp(f"ATLAS run '{run_name}' started — {args.epochs} epochs, vision={args.use_vision}")
 
+    model_type     = 'fused' if args.use_vision else 'cross_attention'
+    overfit_prefix = 'overfit_' if args.overfit else ''
+    best_ckpt_name = f'best_{overfit_prefix}{"fused" if args.use_vision else "model"}.pth'
     best_val_loss  = float('inf')
     patience_count = 0
+
+    def _save_ckpt(path, extra=None):
+        d = {
+            'epoch': epoch, 'model_type': model_type,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'val_acc': val_acc, 'val_loss': val_loss,
+        }
+        if extra:
+            d.update(extra)
+        torch.save(d, path)
 
     for epoch in range(args.epochs):
         logger.info(f"Epoch {epoch+1}/{args.epochs}")
 
-        train_loss, train_acc, grad_norm = train_epoch(model, train_loader, criterion, optimizer, device)
+        train_loss, train_acc, grad_norm = train_epoch(model, train_loader, criterion, optimizer, device, scaler, amp_enabled)
         val_loss,   val_acc              = validate(model, val_loader, criterion, device)
         lr = optimizer.param_groups[0]['lr']
 
@@ -147,23 +167,15 @@ def train(args, train_dataset, val_dataset, criterion):
         if val_loss == val_loss and val_loss < best_val_loss:
             best_val_loss  = val_loss
             patience_count = 0
-            ckpt_name = 'best_fused.pth' if args.use_vision else 'best_model.pth'
-            torch.save({
-                'epoch': epoch, 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_acc': val_acc, 'val_loss': val_loss,
-            }, checkpoint_dir / ckpt_name)
-            logger.info(f"Saved best model (val_loss: {val_loss:.4f})")
+            _save_ckpt(checkpoint_dir / best_ckpt_name)
+            logger.info(f"Saved best model → {best_ckpt_name} (val_loss: {val_loss:.4f})")
         else:
             patience_count += 1
 
         # periodic checkpoint
         if (epoch + 1) % 5 == 0:
-            torch.save({
-                'epoch': epoch, 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_acc': val_acc, 'val_loss': val_loss,
-            }, checkpoint_dir / f'epoch_{epoch+1:03d}.pth')
+            type_tag = 'fused' if args.use_vision else 'traj'
+            _save_ckpt(checkpoint_dir / f'epoch_{epoch+1:03d}_{type_tag}.pth')
 
         if patience_count >= args.patience:
             logger.info(f"Early stopping at epoch {epoch+1} (no improvement for {args.patience} epochs)")
@@ -182,7 +194,6 @@ def main():
     parser = argparse.ArgumentParser(description='Train violation detection model')
     parser.add_argument('--config',         type=str,   default=None)
     parser.add_argument('--data_root',      type=str,   default='/home/satria/Project/ATLAS')
-    parser.add_argument('--h5_path',        type=str,   default=None)
     parser.add_argument('--videos',         nargs='+',  type=int, default=None)
     parser.add_argument('--epochs',         type=int,   default=20)
     parser.add_argument('--batch_size',     type=int,   default=2)
@@ -194,6 +205,7 @@ def main():
     parser.add_argument('--run_name',       type=str,   default=None)
     parser.add_argument('--no_wandb',       action='store_true')
     parser.add_argument('--no_notify',      action='store_true')
+    parser.add_argument('--no_amp',         action='store_true')
     parser.add_argument('--use_vision',     action='store_true')
     parser.add_argument('--overfit',        action='store_true')
 
@@ -212,16 +224,13 @@ def main():
     torch.cuda.manual_seed_all(args.seed)
 
     data_root = Path(args.data_root)
-    h5_path   = Path(args.h5_path) if args.h5_path else None
-    if h5_path and not h5_path.is_absolute():
-        h5_path = data_root / h5_path
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     if args.overfit:
         logger.info("=== OVERFIT MODE: video_001 only ===")
         full_dataset  = load_violation_dataset(
             data_root=data_root, label_file='train', num_frames=32, top_k=args.top_k,
-            video_filter='video_001', use_vision=args.use_vision, h5_path=h5_path,
+            video_filter='video_001', use_vision=args.use_vision,
         )
         train_dataset = full_dataset
         val_dataset   = full_dataset
@@ -230,7 +239,7 @@ def main():
         logger.info("Loading train dataset from train_labels.pkl")
         full_dataset  = load_violation_dataset(
             data_root=data_root, label_file='train', num_frames=32, top_k=args.top_k,
-            video_filter=args.videos, use_vision=args.use_vision, h5_path=h5_path,
+            video_filter=args.videos, use_vision=args.use_vision,
         )
         train_dataset, val_dataset, train_idx = _scene_split(full_dataset, args.seed)
         train_labels = [full_dataset.labels[i].annotation for i in train_idx]

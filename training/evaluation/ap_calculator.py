@@ -16,12 +16,6 @@ def _pr_points(predictions, target_class, n_pos, score_key):
     return precisions, recalls
 
 
-def _resolve_n_pos(predictions, target_class, n_gt, score_key):
-    return n_gt if n_gt is not None else sum(
-        1 for p in predictions if p[score_key] and p["gt_label"] == target_class
-        # Use gt_label directly — score_key not needed for counting
-    )
-
 
 def compute_ap(predictions, target_class, n_gt=None, score_key="score"):
     if not predictions:

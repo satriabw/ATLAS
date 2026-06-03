@@ -33,7 +33,9 @@ def main():
                 print(f"{src_path.name}: {len(keys)} keys")
                 for key in tqdm(keys, desc=src_path.name):
                     if key not in out_f:
-                        src_f.copy(key, out_f)
+                        # External link: no data copy. Resolved relative to the
+                        # master file's directory, so shards must sit beside it.
+                        out_f[key] = h5py.ExternalLink(src_path.name, key)
 
     total = 0
     with h5py.File(output, "r") as f:

@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 import tempfile
 import zipfile
 from pathlib import Path
@@ -19,13 +20,14 @@ DATA_DIR = PROJECT_ROOT / "data"
 ZIP_RANGES = {
     "29983897.zip": range(1, 41),
     "30050131.zip": range(41, 81),
-    "30051131.zip": range(81, 121),
+    "30051331.zip": range(81, 121),
 }
 
 
 def _detect_lz4():
+    probe = f"/tmp/_lz4probe_{os.getpid()}.h5"
     try:
-        with h5py.File("/tmp/_lz4probe.h5", "w") as f:
+        with h5py.File(probe, "w") as f:
             f.create_dataset("x", data=np.zeros(4, dtype=np.uint8), compression="lz4")
         return "lz4"
     except Exception:

@@ -12,19 +12,25 @@ from .labels import ViolationLabel, parse_train_label
 from .trajectory import DEFAULT_TOP_K, build_group_trajectory, resample_trajectory, padding_mask
 import h5py
 
-from .frames import load_frames, load_frames_h5
+from .frames import load_frames_h5
 
 logger = logging.getLogger(__name__)
 
 
 class ViolationDataset(Dataset):
-    def __init__(self, labels, traj_data, num_frames=32, top_k=DEFAULT_TOP_K, video_dir=None, h5_path=None):
+    def __init__(self, labels, traj_data, num_frames=32, top_k=DEFAULT_TOP_K, h5_path=None):
         self.labels     = labels
         self.traj_data  = traj_data
         self.num_frames = num_frames
         self.top_k      = top_k
-        self.video_dir  = Path(video_dir) if video_dir is not None else None
-        self.h5_path    = Path(h5_path) if h5_path else None
+        self._h5_file   = h5py.File(Path(h5_path), 'r') if h5_path else None
+
+    def __del__(self):
+        if getattr(self, '_h5_file', None) is not None:
+            try:
+                self._h5_file.close()
+            except Exception:
+                pass
 
     def __len__(self):
         return len(self.labels)
@@ -45,23 +51,9 @@ class ViolationDataset(Dataset):
             'tracking_id':    label.tracking_id,
             'start_frame':    label.start_frame,
         }
-        if self.h5_path is not None:
+        if self._h5_file is not None:
             h5_key = f"V{label.video_id[-3:]}_{label.tracking_id}_{label.roi}"
-            try:
-                with h5py.File(self.h5_path, 'r') as hf:
-                    sample['frames'] = load_frames_h5(hf, h5_key, self.num_frames)
-            except KeyError:
-                logger.warning(f"H5 key not found: {h5_key}; falling back to video_dir" if self.video_dir else f"H5 key not found: {h5_key}; returning sample without frames")
-                if self.video_dir is not None:
-                    video_path = self.video_dir / f'{label.video_id}.avi'
-                    sample['frames'] = load_frames(
-                        video_path, label.start_frame, label.end_frame, self.num_frames
-                    )
-        elif self.video_dir is not None:
-            video_path = self.video_dir / f'{label.video_id}.avi'
-            sample['frames'] = load_frames(
-                video_path, label.start_frame, label.end_frame, self.num_frames
-            )
+            sample['frames'] = load_frames_h5(self._h5_file, h5_key, self.num_frames)
         return sample
 
     def _get_trajectories(self, video_id, tracking_id, roi):
@@ -160,7 +152,6 @@ def load_violation_dataset(
     top_k: int = DEFAULT_TOP_K,
     video_filter=None,
     use_vision: bool = False,
-    h5_path=None,
 ) -> ViolationDataset:
     data_root = Path(data_root)
     pkl_path  = data_root / 'data' / 'raw' / 'labels' / f'{label_file}_labels.pkl'
@@ -177,8 +168,19 @@ def load_violation_dataset(
     traj_data, frame_ranges = _load_parquet_trajectories(video_ids, parquet_dir, top_k)
     labels = _assemble_labels(parsed, frame_ranges)
 
-    video_dir = data_root / 'data' / 'raw' / 'video' if use_vision else None
+    h5_path = None
+    if use_vision:
+        h5_path = data_root / 'data' / 'raw' / 'video' / 'frames.h5'
+        if not h5_path.exists():
+            raise FileNotFoundError(f"frames.h5 not found at {h5_path}")
+        with h5py.File(h5_path, 'r') as hf:
+            h5_keys = set(hf.keys())
+        before = len(labels)
+        labels = [l for l in labels if f"V{l.video_id[-3:]}_{l.tracking_id}_{l.roi}" in h5_keys]
+        skipped = before - len(labels)
+        if skipped:
+            logger.warning(f"Skipped {skipped} labels with no h5 entry ({len(labels)} remain)")
     return ViolationDataset(
         labels=labels, traj_data=traj_data,
-        num_frames=num_frames, top_k=top_k, video_dir=video_dir, h5_path=h5_path,
+        num_frames=num_frames, top_k=top_k, h5_path=h5_path,
     )
