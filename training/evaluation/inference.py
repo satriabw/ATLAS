@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import pickle
-from pathlib import Path
 
 import h5py
 import numpy as np
@@ -11,8 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from dataset.labels import parse_train_label
-from dataset.trajectory import DEFAULT_TOP_K, build_group_trajectory, resample_trajectory, padding_mask, _to_frames, _to_loc
-from dataset.frames import IMAGENET_MEAN, IMAGENET_STD
+from dataset.trajectory import DEFAULT_TOP_K, build_group_trajectory, resample_trajectory, padding_mask
 
 logger = logging.getLogger(__name__)
 
@@ -32,20 +30,7 @@ def _build_ped_stack(ped_feats_raw, num_frames, top_k):
 
 
 def _build_event(vid, v_track_id, roi, group, gt_label, num_frames, top_k):
-    all_frames, all_vloc = [], []
-    for _, row in group.iterrows():
-        f = _to_frames(row["frames"])
-        v = _to_loc(row["v_loc_planar"])
-        n = min(len(f), len(v))
-        all_frames.append(f[:n])
-        all_vloc.append(v[:n])
-    frames_cat = np.concatenate(all_frames)
-    vloc_cat   = np.vstack(all_vloc)
-    order      = np.argsort(frames_cat, kind="stable")
-    frames_cat = frames_cat[order]
-    vloc_cat   = vloc_cat[order]
-
-    _, _, vehicle_feat_raw, ped_feats_raw = build_group_trajectory(group, top_k)
+    _, vehicle_feat_raw, ped_feats_raw = build_group_trajectory(group, top_k)
     v_arr, v_len = resample_trajectory(vehicle_feat_raw, num_frames)
     p_arr, p_mask = _build_ped_stack(ped_feats_raw, num_frames, top_k)
 
@@ -54,10 +39,6 @@ def _build_event(vid, v_track_id, roi, group, gt_label, num_frames, top_k):
         "v_track_id":  int(v_track_id),
         "roi":         str(roi),
         "gt_label":    gt_label,
-        "frame_start": int(frames_cat[0]),
-        "frame_end":   int(frames_cat[-1]),
-        "pos_start":   vloc_cat[0].tolist(),
-        "pos_end":     vloc_cat[-1].tolist(),
         "eiou":        1.0,
         "_v_traj":     v_arr,
         "_p_traj":     p_arr,

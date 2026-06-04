@@ -1,4 +1,5 @@
 import random
+import sys
 import yaml
 import numpy as np
 import torch
@@ -10,10 +11,19 @@ from tqdm import tqdm
 
 from dataset import load_violation_dataset
 from models import CrossAttentionModel, FusedModel
-from notify import send_whatsapp
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def _notify(message):
+    # Best-effort WhatsApp notification; notify lives under scripts/ so training has no hard dependency on it.
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
+        from notify import send_whatsapp
+        send_whatsapp(message)
+    except Exception as e:
+        logger.warning(f"Notification skipped: {e}")
 
 
 def _forward(model, batch, device):
@@ -122,7 +132,7 @@ def train(args, train_dataset, val_dataset, criterion):
         wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
 
     if not args.no_notify:
-        send_whatsapp(f"ATLAS run '{run_name}' started — {args.epochs} epochs, vision={args.use_vision}")
+        _notify(f"ATLAS run '{run_name}' started — {args.epochs} epochs, vision={args.use_vision}")
 
     model_type     = 'fused' if args.use_vision else 'cross_attention'
     overfit_prefix = 'overfit_' if args.overfit else ''
@@ -185,7 +195,7 @@ def train(args, train_dataset, val_dataset, criterion):
         wandb.finish()
 
     if not args.no_notify:
-        send_whatsapp(f"ATLAS run '{run_name}' done — best val loss: {best_val_loss:.4f}")
+        _notify(f"ATLAS run '{run_name}' done — best val loss: {best_val_loss:.4f}")
     logger.info(f"Training completed. Best val loss: {best_val_loss:.4f}")
     return model
 

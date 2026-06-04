@@ -8,7 +8,6 @@ class ViolationLabel:
     tracking_id: int
     roi: str
     start_frame: int
-    end_frame: int
     annotation: int  # 0=violation, 1=compliance
 
 

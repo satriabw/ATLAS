@@ -67,7 +67,7 @@ def build_group_trajectory(group_df, top_k=DEFAULT_TOP_K):
     group_df = group_df.sort_values('_first_frame').reset_index(drop=True)
 
     all_frames = np.concatenate([_to_frames(r['frames']) for _, r in group_df.iterrows()])
-    start_frame, end_frame = int(all_frames.min()), int(all_frames.max())
+    start_frame = int(all_frames.min())
 
     ped_ids = group_df['p_track_id'].unique()
     vehicle_feat = _build_vehicle_feat(group_df)
@@ -79,7 +79,7 @@ def build_group_trajectory(group_df, top_k=DEFAULT_TOP_K):
         p_rel = p_loc_k - v_loc_k
         ped_feats.append(np.concatenate([p_rel, p_sp_k], axis=1).astype(np.float32))
 
-    return start_frame, end_frame, vehicle_feat, ped_feats
+    return start_frame, vehicle_feat, ped_feats
 
 def resample_trajectory(features, num_frames):
     T = features.shape[0]

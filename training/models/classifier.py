@@ -90,7 +90,7 @@ class FusedModel(nn.Module):
             nn.Linear(hidden_dim * 2, 64), nn.ReLU(), nn.Dropout(0.3), nn.Linear(64, num_classes),
         )
 
-    def forward(self, vehicle_feat, ped_feat, frames, v_padding_mask=None, p_padding_mask=None, frame_mask=None):
+    def forward(self, vehicle_feat, ped_feat, frames, v_padding_mask=None, p_padding_mask=None):
         vehicle_enc = self.vehicle_encoder(vehicle_feat)
         ped_enc, ped_key_mask = _encode_peds(
             self.ped_encoder, ped_feat, p_padding_mask, self.top_k, self.num_frames
@@ -112,10 +112,6 @@ class FusedModel(nn.Module):
         if v_padding_mask is not None:
             traj_context = traj_context.masked_fill(v_padding_mask.unsqueeze(-1), float('-inf'))
 
-        if frame_mask is not None:
-            fused = fused.masked_fill(frame_mask.unsqueeze(-1), float('-inf'))
-
         traj_pooled  = torch.nan_to_num(traj_context.max(dim=1).values, neginf=0.0)
-        # all-invalid vision frames (frame_mask all True) produce -inf → 0.0 via nan_to_num
         fused_pooled = torch.nan_to_num(fused.max(dim=1).values, neginf=0.0)
         return self.classifier(torch.cat([traj_pooled, fused_pooled], dim=-1))

@@ -1,7 +1,6 @@
 import logging
 import pickle
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -37,7 +36,7 @@ class ViolationDataset(Dataset):
 
     def __getitem__(self, idx):
         label = self.labels[idx]
-        v_feat, p_feat, has_ped, v_mask, p_mask = self._get_trajectories(
+        v_feat, p_feat, v_mask, p_mask = self._get_trajectories(
             label.video_id, label.tracking_id, label.roi
         )
         sample = {
@@ -45,7 +44,6 @@ class ViolationDataset(Dataset):
             'ped_feat':       p_feat,
             'v_padding_mask': v_mask,
             'p_padding_mask': p_mask,
-            'has_pedestrian': torch.tensor(has_ped, dtype=torch.bool),
             'label':          torch.tensor(label.annotation, dtype=torch.long),
             'video_id':       label.video_id,
             'tracking_id':    label.tracking_id,
@@ -82,7 +80,6 @@ class ViolationDataset(Dataset):
         return (
             torch.from_numpy(v_arr),
             torch.from_numpy(np.concatenate(p_arrs, axis=0)),
-            True,
             torch.from_numpy(padding_mask(v_len, self.num_frames)),
             torch.from_numpy(np.concatenate(p_masks, axis=0)),
         )
@@ -119,9 +116,9 @@ def _load_parquet_trajectories(video_ids, parquet_dir, top_k):
         for (v_track_id, roi), group in df.groupby(['v_track_id', 'roi']):
             key = (vid, int(v_track_id), str(roi))
             try:
-                s, e, v_feat, ped_feats = build_group_trajectory(group, top_k)
+                s, v_feat, ped_feats = build_group_trajectory(group, top_k)
                 traj_data[key]    = (v_feat, ped_feats)
-                frame_ranges[key] = (s, e)
+                frame_ranges[key] = s
             except Exception as ex:
                 logger.warning(f"Could not build trajectory for {key}: {ex}")
     logger.info(f"Built trajectory cache: {len(traj_data)} groups")
@@ -136,10 +133,10 @@ def _assemble_labels(parsed, frame_ranges):
             logger.warning(f"No parquet group for {key}, skipping")
             skipped += 1
             continue
-        s, e = frame_ranges[key]
+        s = frame_ranges[key]
         labels.append(ViolationLabel(
             video_id=vid, tracking_id=tid, roi=roi,
-            start_frame=s, end_frame=e, annotation=ann,
+            start_frame=s, annotation=ann,
         ))
     logger.info(f"Final dataset: {len(labels)} samples ({skipped} skipped)")
     return labels
