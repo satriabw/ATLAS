@@ -20,3 +20,4 @@ scripts/overfit_fusion.py
 scripts/prep_bev_viz.py
 scripts/visualize_analysis.py
 scripts/visualize_stats.py
+training/wandb/*

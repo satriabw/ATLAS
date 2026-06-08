@@ -80,14 +80,13 @@ def _collect_events(parquet_dir, labels_pkl, video_ids, num_frames, top_k):
     return events
 
 
-def _preload_h5_frames(events, h5_path, num_frames):
+def _load_h5_batch(hf, events, start, end, num_frames):
     from dataset.frames import load_frames_h5
-    frame_tensors = {}
-    with h5py.File(h5_path, 'r') as hf:
-        for i, ev in enumerate(events):
-            key = f"V{ev['video_id'][-3:]}_{ev['v_track_id']}_{ev['roi']}"
-            frame_tensors[i] = load_frames_h5(hf, key, num_frames)
-    return frame_tensors
+    tensors = []
+    for ev in events[start:end]:
+        key = f"V{ev['video_id'][-3:]}_{ev['v_track_id']}_{ev['roi']}"
+        tensors.append(load_frames_h5(hf, key, num_frames))
+    return torch.stack(tensors)
 
 
 def _run_inference(model, events, device, num_frames, batch_size, h5_path=None):
@@ -96,29 +95,28 @@ def _run_inference(model, events, device, num_frames, batch_size, h5_path=None):
     v_masks = np.stack([e["_v_mask"] for e in events])
     p_masks = np.stack([e["_p_mask"] for e in events])
 
-    if h5_path is not None:
-        logger.info("Pre-loading frames from H5 …")
-        preloaded_frames = _preload_h5_frames(events, h5_path, num_frames)
+    hf = h5py.File(h5_path, 'r') if h5_path is not None else None
+    try:
+        scores = []
+        for start in range(0, len(v_trajs), batch_size):
+            end      = min(start + batch_size, len(v_trajs))
+            sl       = slice(start, end)
+            v_batch  = torch.from_numpy(v_trajs[sl]).to(device)
+            p_batch  = torch.from_numpy(p_trajs[sl]).to(device)
+            vm_batch = torch.from_numpy(v_masks[sl]).to(device)
+            pm_batch = torch.from_numpy(p_masks[sl]).to(device)
 
-    scores = []
-    for start in range(0, len(v_trajs), batch_size):
-        sl       = slice(start, start + batch_size)
-        v_batch  = torch.from_numpy(v_trajs[sl]).to(device)
-        p_batch  = torch.from_numpy(p_trajs[sl]).to(device)
-        vm_batch = torch.from_numpy(v_masks[sl]).to(device)
-        pm_batch = torch.from_numpy(p_masks[sl]).to(device)
-
-        with torch.no_grad():
-            if h5_path is not None:
-                end = min(start + batch_size, len(v_trajs))
-                frames_batch = torch.stack(
-                    [preloaded_frames[i] for i in range(start, end)]
-                ).to(device)
-                logits = model(v_batch, p_batch, frames_batch, vm_batch, pm_batch)
-            else:
-                logits = model(v_batch, p_batch, vm_batch, pm_batch)
-            probs = F.softmax(logits, dim=1)
-            scores.extend(probs[:, 0].cpu().tolist())
+            with torch.no_grad():
+                if hf is not None:
+                    frames_batch = _load_h5_batch(hf, events, start, end, num_frames).to(device)
+                    logits = model(v_batch, p_batch, frames_batch, vm_batch, pm_batch)
+                else:
+                    logits = model(v_batch, p_batch, vm_batch, pm_batch)
+                probs = F.softmax(logits, dim=1)
+                scores.extend(probs[:, 0].cpu().tolist())
+    finally:
+        if hf is not None:
+            hf.close()
 
     return scores
 

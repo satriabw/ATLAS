@@ -159,7 +159,7 @@ def train(args, train_dataset, val_dataset, criterion):
         lr = optimizer.param_groups[0]['lr']
 
         logger.info(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, Grad Norm: {grad_norm:.4f}")
-        if val_loss == val_loss:
+        if val_loss:
             logger.info(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
             scheduler.step(val_loss)
         else:
@@ -174,7 +174,7 @@ def train(args, train_dataset, val_dataset, criterion):
             })
 
         # best checkpoint
-        if val_loss == val_loss and val_loss < best_val_loss:
+        if val_loss and val_loss < best_val_loss:
             best_val_loss  = val_loss
             patience_count = 0
             _save_ckpt(checkpoint_dir / best_ckpt_name)
