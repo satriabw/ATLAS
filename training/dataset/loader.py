@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .labels import ViolationLabel, parse_train_label
+from .tracking import group_grid_boxes, parse_tracking
 from .trajectory import DEFAULT_TOP_K, build_group_trajectory, resample_trajectory, padding_mask
 import h5py
 
@@ -17,11 +18,13 @@ logger = logging.getLogger(__name__)
 
 
 class ViolationDataset(Dataset):
-    def __init__(self, labels, traj_data, num_frames=32, top_k=DEFAULT_TOP_K, h5_path=None):
+    def __init__(self, labels, traj_data, num_frames=32, top_k=DEFAULT_TOP_K, h5_path=None,
+                 box_data=None):
         self.labels     = labels
         self.traj_data  = traj_data
         self.num_frames = num_frames
         self.top_k      = top_k
+        self.box_data   = box_data
         self._h5_file   = h5py.File(Path(h5_path), 'r') if h5_path else None
 
     def __del__(self):
@@ -51,7 +54,8 @@ class ViolationDataset(Dataset):
         }
         if self._h5_file is not None:
             h5_key = f"V{label.video_id[-3:]}_{label.tracking_id}_{label.roi}"
-            sample['frames'] = load_frames_h5(self._h5_file, h5_key, self.num_frames)
+            boxes = self.box_data.get((label.video_id, label.tracking_id, label.roi)) if self.box_data else None
+            sample['frames'] = load_frames_h5(self._h5_file, h5_key, self.num_frames, roi=label.roi, boxes=boxes)
         return sample
 
     def _get_trajectories(self, video_id, tracking_id, roi):
@@ -65,16 +69,19 @@ class ViolationDataset(Dataset):
             )
 
         vehicle_feat_raw, ped_feats_raw = entry
-        v_arr, v_len = resample_trajectory(vehicle_feat_raw, self.num_frames)
+        # With vision (h5), stretch-resample so trajectory steps align with frame slots.
+        stretch = self._h5_file is not None
+        v_arr, v_len = resample_trajectory(vehicle_feat_raw, self.num_frames, stretch=stretch)
 
         p_arrs, p_masks = [], []
         for pf in ped_feats_raw[:self.top_k]:
-            pf_arr, p_len = resample_trajectory(pf, self.num_frames)
+            pf_arr, p_len = resample_trajectory(pf, self.num_frames, stretch=stretch)
             p_arrs.append(pf_arr)
             p_masks.append(padding_mask(p_len, self.num_frames))
 
+        feat_dim = vehicle_feat_raw.shape[1]
         while len(p_arrs) < self.top_k:
-            p_arrs.append(np.zeros((self.num_frames, 3), dtype=np.float32))
+            p_arrs.append(np.zeros((self.num_frames, feat_dim), dtype=np.float32))
             p_masks.append(np.ones(self.num_frames, dtype=bool))
 
         return (
@@ -105,24 +112,37 @@ def _parse_labels(pkl_path, allowed):
     return parsed
 
 
-def _load_parquet_trajectories(video_ids, parquet_dir, top_k):
-    traj_data, frame_ranges = {}, {}
+def _load_parquet_trajectories(video_ids, parquet_dir, top_k, tracking_dir=None, num_frames=32):
+    traj_data, frame_ranges, box_data = {}, {}, {}
     for vid in video_ids:
         parquet_path = parquet_dir / f'{vid}_interactions.parquet'
         if not parquet_path.exists():
             logger.warning(f"Parquet not found for {vid}: {parquet_path}")
             continue
+        track_frames = None
+        if tracking_dir is not None:
+            tracking_path = tracking_dir / f'{vid}.txt'
+            if tracking_path.exists():
+                track_frames = parse_tracking(tracking_path)
+            else:
+                logger.warning(f"Tracking not found for {vid}: {tracking_path}")
         df = pd.read_parquet(parquet_path)
         for (v_track_id, roi), group in df.groupby(['v_track_id', 'roi']):
             key = (vid, int(v_track_id), str(roi))
             try:
-                s, v_feat, ped_feats = build_group_trajectory(group, top_k)
+                s, v_feat, ped_feats, ped_ids = build_group_trajectory(
+                    group, top_k, with_time=tracking_dir is not None)
                 traj_data[key]    = (v_feat, ped_feats)
                 frame_ranges[key] = s
+                if track_frames is not None:
+                    # Same grid build_h5 used to sample the frames for this group.
+                    all_f = np.concatenate([np.asarray(f).ravel() for f in group['frames']])
+                    grid = np.linspace(int(all_f.min()), int(all_f.max()), num_frames, dtype=int)
+                    box_data[key] = group_grid_boxes(track_frames, grid, int(v_track_id), ped_ids)
             except Exception as ex:
                 logger.warning(f"Could not build trajectory for {key}: {ex}")
     logger.info(f"Built trajectory cache: {len(traj_data)} groups")
-    return traj_data, frame_ranges
+    return traj_data, frame_ranges, box_data
 
 
 def _assemble_labels(parsed, frame_ranges):
@@ -149,6 +169,7 @@ def load_violation_dataset(
     top_k: int = DEFAULT_TOP_K,
     video_filter=None,
     use_vision: bool = False,
+    h5_name: str = 'frames.h5',
 ) -> ViolationDataset:
     data_root = Path(data_root)
     pkl_path  = data_root / 'data' / 'raw' / 'labels' / f'{label_file}_labels.pkl'
@@ -162,14 +183,17 @@ def load_violation_dataset(
     video_ids   = sorted({p[0] for p in parsed})
     parquet_dir = data_root / 'data' / 'processed' / 'interactions'
 
-    traj_data, frame_ranges = _load_parquet_trajectories(video_ids, parquet_dir, top_k)
+    tracking_dir = data_root / 'data' / 'raw' / 'tracking' if use_vision else None
+    traj_data, frame_ranges, box_data = _load_parquet_trajectories(
+        video_ids, parquet_dir, top_k, tracking_dir=tracking_dir, num_frames=num_frames,
+    )
     labels = _assemble_labels(parsed, frame_ranges)
 
     h5_path = None
     if use_vision:
-        h5_path = data_root / 'data' / 'raw' / 'video' / 'frames.h5'
+        h5_path = data_root / 'data' / 'raw' / 'video' / h5_name
         if not h5_path.exists():
-            raise FileNotFoundError(f"frames.h5 not found at {h5_path}")
+            raise FileNotFoundError(f"{h5_name} not found at {h5_path}")
         with h5py.File(h5_path, 'r') as hf:
             h5_keys = set(hf.keys())
         before = len(labels)
@@ -180,4 +204,5 @@ def load_violation_dataset(
     return ViolationDataset(
         labels=labels, traj_data=traj_data,
         num_frames=num_frames, top_k=top_k, h5_path=h5_path,
+        box_data=box_data if use_vision else None,
     )

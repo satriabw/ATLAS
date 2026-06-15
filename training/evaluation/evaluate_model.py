@@ -11,7 +11,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dataset.trajectory import DEFAULT_TOP_K
-from models import CrossAttentionModel, FusedModel
+from models import CrossAttentionModel, FusedModel, VisionOnlyModel
 from evaluation.ap_calculator import compute_map, compute_pr_curve
 from evaluation.inference import build_events_with_scores
 
@@ -74,7 +74,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Evaluate model with World-EIoU AP")
     parser.add_argument("--checkpoint",     type=Path, default=None)
-    parser.add_argument("--model-type",     choices=["cross_attention", "fused"], default="cross_attention")
+    parser.add_argument("--model-type",     choices=["cross_attention", "fused", "vision"], default="cross_attention")
     parser.add_argument("--parquet-dir",    type=Path, default=Path("/home/satria/Project/ATLAS/data/processed/interactions"))
     parser.add_argument("--labels-pkl",     type=Path, default=Path("/home/satria/Project/ATLAS/data/raw/labels/test_labels.pkl"))
     parser.add_argument("--video-ids",      nargs="+", type=int, default=list(range(2, 121, 2)))
@@ -99,7 +99,7 @@ def main() -> None:
     logger.info(f"Device: {device}")
 
     if args.checkpoint is None:
-        ckpt_name = "best_fused.pth" if args.model_type == "fused" else "best_model.pth"
+        ckpt_name = {"fused": "best_fused.pth", "vision": "best_vision.pth"}.get(args.model_type, "best_model.pth")
         args.checkpoint = Path("checkpoints") / ckpt_name
 
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
@@ -109,7 +109,10 @@ def main() -> None:
     if model_type != args.model_type:
         logger.info(f"Checkpoint model_type='{model_type}' overrides --model-type='{args.model_type}'")
 
-    if model_type == "fused":
+    if model_type == "vision":
+        model = VisionOnlyModel(num_classes=2, num_frames=args.num_frames,
+                                backbone=ckpt.get("backbone", "resnet18")).to(device)
+    elif model_type == "fused":
         model = FusedModel(num_classes=2, top_k=args.top_k, num_frames=args.num_frames).to(device)
     else:
         model = CrossAttentionModel(num_classes=2, top_k=args.top_k, num_frames=args.num_frames).to(device)
@@ -117,12 +120,16 @@ def main() -> None:
     model.load_state_dict(ckpt["model_state_dict"])
     logger.info(f"Loaded checkpoint: {args.checkpoint.name} (epoch {ckpt['epoch']}, val_acc={ckpt.get('val_acc', float('nan')):.2f}%)")
 
-    h5_path = args.parquet_dir.parent.parent / "raw" / "video" / "frames.h5" if model_type == "fused" else None
+    # h5 file name comes from the checkpoint so evaluation matches the
+    # representation the model was trained on (R0 frames.h5 vs R2 frames_r2.h5).
+    h5_name = ckpt.get("h5", "frames.h5")
+    h5_path = args.parquet_dir.parent.parent / "raw" / "video" / h5_name if model_type in ("fused", "vision") else None
     predictions = build_events_with_scores(
         args.parquet_dir, args.labels_pkl, video_ids, model, device,
         num_frames=args.num_frames, top_k=args.top_k,
         batch_size=args.batch_size,
         h5_path=h5_path,
+        vision_only=(model_type == "vision"),
     )
 
     result = compute_map(predictions, eiou_threshold=args.eiou_threshold)
