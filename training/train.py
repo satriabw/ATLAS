@@ -125,7 +125,7 @@ def _scene_split(full_dataset, seed):
     return Subset(full_dataset, train_idx), Subset(full_dataset, val_idx), train_idx
 
 
-def train(args, train_dataset, val_dataset, criterion):
+def train(args, train_dataset, val_dataset, criterion, model=None):
     import wandb
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,  num_workers=0, pin_memory=False)
@@ -135,14 +135,17 @@ def train(args, train_dataset, val_dataset, criterion):
     logger.info(f"Using device: {device}")
     logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
-    if args.vision_only:
+    if model is not None:
+        # caller-injected model (e.g. train_fused_pooled.py); skip construction
+        model = model.to(device)
+    elif args.vision_only:
         model = VisionOnlyModel(num_classes=2, num_frames=32, backbone=args.backbone,
                                 freeze_vision=args.freeze).to(device)
     elif args.fused:
         model = FusedModel(num_classes=2, top_k=args.top_k, num_frames=32,
                            freeze_vision=args.freeze).to(device)
     else:
-        model = CrossAttentionModel(num_classes=2, top_k=args.top_k, num_frames=32).to(device)
+        model = CrossAttentionModel(num_classes=2, top_k=args.top_k, num_frames=getattr(args, 'num_frames', 32)).to(device)
 
     # Pretrained ResNet layers fine-tune at a lower LR than the fresh heads/GRUs.
     # The inflated conv1 (features.0) carries fresh mask-channel weights, so it

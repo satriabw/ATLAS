@@ -56,7 +56,7 @@ def _box_masks(num: int, h: int, w: int, v_boxes: np.ndarray, p_boxes: np.ndarra
 
 
 def load_frames_h5(h5_file: h5py.File, key: str, num_frames: int, roi: str = None, size: int = 224,
-                   boxes=None) -> torch.Tensor:
+                   boxes=None, window=None) -> torch.Tensor:
     if key not in h5_file:
         raise KeyError(key)
 
@@ -73,8 +73,11 @@ def load_frames_h5(h5_file: h5py.File, key: str, num_frames: int, roi: str = Non
         # polygon, no resize; grounding masks rasterized in crop coordinates.
         if boxes is not None:
             v_boxes, p_boxes = boxes
+            # `crop` attr may not record the true tracking-space window (e.g. the
+            # centered union h5 stored [0,0,size,size]); caller can override.
+            mask_window = tuple(window) if window is not None else tuple(crop)
             masks = _box_masks(len(frames), frames.shape[1], frames.shape[2],
-                               v_boxes, p_boxes, window=tuple(crop))
+                               v_boxes, p_boxes, window=mask_window)
     else:
         if boxes is not None:
             v_boxes, p_boxes = boxes

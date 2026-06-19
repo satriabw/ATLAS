@@ -7,11 +7,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 All training/evaluation scripts must be run from the `training/` directory (they use relative imports):
 
 ```bash
-# Train trajectory-only model
+# Train trajectory-only model (default mode)
 cd training && python train.py --data_root /home/satria/Project/ATLAS --epochs 20 --batch_size 2
 
-# Train with vision fusion
-cd training && python train.py --data_root /home/satria/Project/ATLAS --use_vision --epochs 20
+# Train vision-only model
+cd training && python train.py --data_root /home/satria/Project/ATLAS --mode vision --epochs 20
+
+# Train fused model (trajectory + vision; aux heads fight gradient starvation)
+cd training && python train.py --data_root /home/satria/Project/ATLAS --mode fused --epochs 20
 
 # Overfit on video_001 for sanity-checking
 cd training && python train.py --data_root /home/satria/Project/ATLAS --overfit
@@ -47,7 +50,7 @@ This is a pedestrian-vehicle traffic violation detection system. A "violation" m
 **Models** (`training/models/`):
 - `TrajectoryEncoder`: Bidirectional GRU. Input `(B, T, 3)` → output `(B, T, hidden_dim)`.
 - `CrossAttentionModel`: Vehicle trajectory queries over top-K pedestrian encodings via `nn.MultiheadAttention`, then max-pools over time → 2-class classifier.
-- `FusedModel`: Extends `CrossAttentionModel` with a `VisionEncoder` (ResNet18 backbone). Visual features cross-attend over trajectory context; trajectory and visual pooled vectors are concatenated before classification.
+- `FusedModel`: Trajectory cross-attention plus a `VisionEncoder` (ResNet18 backbone). The classifier concatenates three pooled vectors — `h_traj` (motion), `h_vis` (appearance, a direct vision path), and `h_cross` (trajectory↔frame fusion attention). To counter vision-branch gradient starvation, it also exposes unimodal auxiliary heads (`traj_head`, `vis_head`) when `return_aux=True`; their losses are weighted by `--aux-w-traj` / `--aux-w-vision` in `train.py`. `self.ablate` (`'no_vision'` / `'no_traj'`) zeroes branches for ablation checks.
 - `VisionEncoder`: ResNet18 without final layers, applied frame-by-frame `(B, F, C, H, W)` → `(B, F, output_dim)`.
 
 **Training** (`training/train.py`):

@@ -21,3 +21,7 @@ scripts/prep_bev_viz.py
 scripts/visualize_analysis.py
 scripts/visualize_stats.py
 training/wandb/*
+docs/*
+training/evaluation/ablate_fused.py
+training/evaluation/late_fusion.pyartifacts/
+artifacts/*

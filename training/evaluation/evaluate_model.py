@@ -11,7 +11,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dataset.trajectory import DEFAULT_TOP_K
-from models import CrossAttentionModel, FusedModel, VisionOnlyModel
+from models import CrossAttentionModel, FusedModel, VisionOnlyModel, PooledFusedModel
 from evaluation.ap_calculator import compute_map, compute_pr_curve
 from evaluation.inference import build_events_with_scores
 
@@ -74,7 +74,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Evaluate model with World-EIoU AP")
     parser.add_argument("--checkpoint",     type=Path, default=None)
-    parser.add_argument("--model-type",     choices=["cross_attention", "fused", "vision"], default="cross_attention")
+    parser.add_argument("--model-type",     choices=["cross_attention", "fused", "vision", "fused_pooled"], default="cross_attention")
     parser.add_argument("--parquet-dir",    type=Path, default=Path("/home/satria/Project/ATLAS/data/processed/interactions"))
     parser.add_argument("--labels-pkl",     type=Path, default=Path("/home/satria/Project/ATLAS/data/raw/labels/test_labels.pkl"))
     parser.add_argument("--video-ids",      nargs="+", type=int, default=list(range(2, 121, 2)))
@@ -114,6 +114,8 @@ def main() -> None:
                                 backbone=ckpt.get("backbone", "resnet18")).to(device)
     elif model_type == "fused":
         model = FusedModel(num_classes=2, top_k=args.top_k, num_frames=args.num_frames).to(device)
+    elif model_type == "fused_pooled":
+        model = PooledFusedModel(num_classes=2, top_k=args.top_k, num_frames=args.num_frames).to(device)
     else:
         model = CrossAttentionModel(num_classes=2, top_k=args.top_k, num_frames=args.num_frames).to(device)
 
@@ -123,7 +125,7 @@ def main() -> None:
     # h5 file name comes from the checkpoint so evaluation matches the
     # representation the model was trained on (R0 frames.h5 vs R2 frames_r2.h5).
     h5_name = ckpt.get("h5", "frames.h5")
-    h5_path = args.parquet_dir.parent.parent / "raw" / "video" / h5_name if model_type in ("fused", "vision") else None
+    h5_path = args.parquet_dir.parent.parent / "raw" / "video" / h5_name if model_type in ("fused", "vision", "fused_pooled") else None
     predictions = build_events_with_scores(
         args.parquet_dir, args.labels_pkl, video_ids, model, device,
         num_frames=args.num_frames, top_k=args.top_k,
