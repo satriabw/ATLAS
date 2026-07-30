@@ -11,6 +11,11 @@ extracts one pooled pre-proj backbone vector per event key:
 --bed centered : load_centered_dataset over frames_union_centered.h5 (64-slot
                  clips incl. black pad slots, as consumed by the centered arm).
 
+--kinetics     : skip the fine-tuned checkpoint and use the Kinetics-400 backbone
+                 as-is — a backbone that never saw ATLAS video. Paired
+                 leakage-free control for the fine-tuned features, sharing this
+                 script's preprocessing/pooling exactly (2026-07-23).
+
 Output: one (512,) dataset per key, keyed V{vid}_{tid}_{roi} like the crop h5s.
 """
 import argparse
@@ -33,9 +38,12 @@ log = logging.getLogger(__name__)
 
 
 def _encoder(ckpt_path, device):
-    ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+    # ckpt_path None => keep VisionEncoder3D's Kinetics-400 init untouched, i.e. a
+    # backbone that never saw ATLAS video (leakage-free control for the fine-tuned run).
     model = VisionOnlyModel(num_classes=2, num_frames=32, backbone='r2plus1d')
-    model.load_state_dict(ck['model_state_dict'])
+    if ckpt_path is not None:
+        ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ck['model_state_dict'])
     enc = model.vision_encoder.eval().to(device)
     for p in enc.parameters():
         p.requires_grad = False
@@ -61,6 +69,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data_root', default=str(Path(__file__).resolve().parent.parent))
     p.add_argument('--ckpt', default='training/checkpoints/best_r2plus1d_r2_rebuild.pth')
+    p.add_argument('--kinetics', action='store_true',
+                   help='ignore --ckpt and use the frozen Kinetics-400 backbone (leakage-free)')
     p.add_argument('--bed', choices=['whole', 'centered'], required=True)
     p.add_argument('--out', required=True, help='output h5 path')
     p.add_argument('--batch_size', type=int, default=8)
@@ -69,7 +79,12 @@ def main():
 
     root = Path(args.data_root)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    enc = _encoder(root / args.ckpt if not Path(args.ckpt).is_absolute() else args.ckpt, device)
+    if args.kinetics:
+        log.info("backbone: frozen Kinetics-400 r2plus1d_18 (leakage-free)")
+        enc = _encoder(None, device)
+    else:
+        log.info("backbone: fine-tuned %s", args.ckpt)
+        enc = _encoder(root / args.ckpt if not Path(args.ckpt).is_absolute() else args.ckpt, device)
 
     written = set()
     with h5py.File(args.out, 'w') as fout:
